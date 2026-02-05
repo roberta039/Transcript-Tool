@@ -325,7 +325,7 @@ def get_api_keys_from_secrets():
 def test_api_key(api_key):
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model = genai.GenerativeModel('gemini-2.5-flash')
         response = model.generate_content('Say "OK"')
         return True, "✅ Cheie validă"
     except Exception as e:
@@ -741,7 +741,7 @@ def process_and_transcribe(file_path, source_lang, target_lang, api_key,
             if progress_callback:
                 progress_callback(0.7, "🤖 Transcriere audio...")
             
-            model = genai.GenerativeModel('gemini-1.5-pro')
+            model = genai.GenerativeModel('gemini-2.5-pro')
             
             source = LANGUAGES.get(source_lang, "auto")
             target = LANGUAGES.get(target_lang, "Romanian")
@@ -801,7 +801,7 @@ Formatare:
             if progress_callback:
                 progress_callback(0.8, "🤖 Transcriere video...")
             
-            model = genai.GenerativeModel('gemini-1.5-pro')
+            model = genai.GenerativeModel('gemini-2.5-pro')
             
             source = LANGUAGES.get(source_lang, "auto")
             target = LANGUAGES.get(target_lang, "Romanian")
@@ -1429,7 +1429,7 @@ def render_chat_tab():
                 
                 try:
                     genai.configure(api_key=working_key)
-                    model = genai.GenerativeModel('gemini-1.5-flash')
+                    model = genai.GenerativeModel('gemini-2.5-flash')
                     
                     # Context
                     recent = get_transcriptions(st.session_state.session_id)[:2]
