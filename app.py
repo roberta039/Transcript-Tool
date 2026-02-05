@@ -306,8 +306,8 @@ def render_sidebar():
         st.markdown("### 🔑 Chei API")
         
         # Verifică cheile din secrets
-        if "GEMINI_API_KEY" in st.secrets:
-            save_api_key(st.secrets["GEMINI_API_KEY"])
+        if "GOOGLE_API_KEYS" in st.secrets:
+            save_api_key(st.secrets["GOOGLE_API_KEYS"])
             st.success("✅ Cheie din secrets detectată")
         
         # Afișează cheile existente
