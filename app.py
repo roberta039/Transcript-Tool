@@ -325,7 +325,7 @@ def get_api_keys_from_secrets():
 def test_api_key(api_key):
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.5-flash')
+        model = genai.GenerativeModel('gemini-2.5-flash-lite')
         response = model.generate_content('Say "OK"')
         return True, "✅ Cheie validă"
     except Exception as e:
@@ -1429,7 +1429,7 @@ def render_chat_tab():
                 
                 try:
                     genai.configure(api_key=working_key)
-                    model = genai.GenerativeModel('gemini-2.5-flash')
+                    model = genai.GenerativeModel('gemini-2.5-flash-lite')
                     
                     # Context
                     recent = get_transcriptions(st.session_state.session_id)[:2]
