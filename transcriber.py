@@ -1,5 +1,6 @@
 import streamlit as st
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import tempfile
 import os
 import time
@@ -34,12 +35,11 @@ class VideoTranscriber:
     }
     
     def __init__(self):
-        self.model = None
+        self.client = None
     
-    def initialize_model(self, api_key: str):
-        """Inițializează modelul Gemini"""
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel('gemini-1.5-pro')
+    def initialize_client(self, api_key: str):
+        """Inițializează clientul Gemini"""
+        self.client = genai.Client(api_key=api_key)
     
     def upload_video_to_gemini(self, video_file, progress_callback=None) -> Tuple[Optional[object], Optional[str]]:
         """
@@ -58,19 +58,20 @@ class VideoTranscriber:
             if progress_callback:
                 progress_callback(0.3, "Încărcare pe serverele Google...")
             
-            # Încarcă pe Google
-            video_file_obj = genai.upload_file(path=tmp_path)
+            # Încarcă pe Google folosind noul API
+            with open(tmp_path, 'rb') as f:
+                video_file_obj = self.client.files.upload(file=f)
             
             if progress_callback:
                 progress_callback(0.5, "Procesare video...")
             
             # Așteaptă procesarea
-            while video_file_obj.state.name == "PROCESSING":
+            while video_file_obj.state == types.FileState.PROCESSING:
                 time.sleep(2)
-                video_file_obj = genai.get_file(video_file_obj.name)
+                video_file_obj = self.client.files.get(name=video_file_obj.name)
                 
-            if video_file_obj.state.name == "FAILED":
-                return None, f"❌ Procesarea video a eșuat: {video_file_obj.state.name}"
+            if video_file_obj.state == types.FileState.FAILED:
+                return None, f"❌ Procesarea video a eșuat"
             
             # Șterge fișierul temporar
             os.unlink(tmp_path)
@@ -100,10 +101,11 @@ class VideoTranscriber:
                 # Construiește prompt-ul
                 prompt = self._build_prompt(source_lang, target_lang)
                 
-                # Generează transcrierea
-                response = self.model.generate_content(
-                    [video_file_obj, prompt],
-                    generation_config=genai.types.GenerationConfig(
+                # Generează transcrierea folosind noul API
+                response = self.client.models.generate_content(
+                    model='gemini-2.0-flash-exp',
+                    contents=[video_file_obj, prompt],
+                    config=types.GenerateContentConfig(
                         temperature=0.3,
                         max_output_tokens=8192
                     )
@@ -125,7 +127,7 @@ class VideoTranscriber:
                     # Reinițializează cu noua cheie
                     new_key, _ = api_manager.get_working_key()
                     if new_key:
-                        self.initialize_model(new_key)
+                        self.initialize_client(new_key)
                         st.warning(message)
                         continue
                 
@@ -162,7 +164,7 @@ FORMAT DORIT:
     def cleanup_uploaded_file(self, video_file_obj):
         """Șterge fișierul încărcat de pe serverele Google"""
         try:
-            genai.delete_file(video_file_obj.name)
+            self.client.files.delete(name=video_file_obj.name)
         except:
             pass
 
