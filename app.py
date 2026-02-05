@@ -8,17 +8,16 @@ import os
 import time
 from io import BytesIO
 import json
+import re
+import requests
 
-# Încearcă să importe biblioteca Gemini
-GEMINI_AVAILABLE = False
-GEMINI_VERSION = None
-
+# Import Gemini
 try:
     import google.generativeai as genai
     GEMINI_AVAILABLE = True
-    GEMINI_VERSION = "old"
 except ImportError:
     st.error("❌ google-generativeai nu este instalat")
+    GEMINI_AVAILABLE = False
 
 # Import python-docx
 try:
@@ -28,7 +27,21 @@ try:
     DOCX_AVAILABLE = True
 except ImportError:
     DOCX_AVAILABLE = False
-    st.warning("⚠️ python-docx nu este disponibil")
+
+# Import pentru YouTube și procesare video
+try:
+    import yt_dlp
+    YTDLP_AVAILABLE = True
+except ImportError:
+    YTDLP_AVAILABLE = False
+
+try:
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseDownload
+    import io
+    GDRIVE_AVAILABLE = True
+except ImportError:
+    GDRIVE_AVAILABLE = False
 
 # ==================== CONFIGURARE ====================
 
@@ -40,8 +53,9 @@ st.set_page_config(
 )
 
 # LIMITE FIȘIERE
-MAX_FILE_SIZE_MB = 200  # Limita Gemini API
-CHUNK_SIZE_MB = 190  # Dimensiune chunk pentru fișiere mari
+MAX_FILE_SIZE_MB = 1000  # Limită maximă aplicație (1GB)
+GEMINI_DIRECT_UPLOAD_LIMIT_MB = 200  # Limită pentru upload direct Gemini
+YOUTUBE_MAX_DURATION_MINUTES = 120  # Limită durată YouTube (2 ore)
 
 # CSS
 st.markdown("""
@@ -70,18 +84,26 @@ st.markdown("""
         border-left: 4px solid #0066cc;
         margin-bottom: 1rem;
     }
-    .api-key-status {
-        padding: 0.5rem;
-        border-radius: 5px;
-        margin: 0.5rem 0;
+    .warning-box {
+        background-color: #fff3cd;
+        border: 1px solid #ffc107;
+        padding: 1rem;
+        border-radius: 8px;
+        margin: 1rem 0;
     }
-    .api-active {
-        background-color: #d4edda;
-        color: #155724;
-    }
-    .api-expired {
+    .error-box {
         background-color: #f8d7da;
-        color: #721c24;
+        border: 1px solid #dc3545;
+        padding: 1rem;
+        border-radius: 8px;
+        margin: 1rem 0;
+    }
+    .success-box {
+        background-color: #d4edda;
+        border: 1px solid #28a745;
+        padding: 1rem;
+        border-radius: 8px;
+        margin: 1rem 0;
     }
     .transcription-box {
         background-color: #f8f9fa;
@@ -93,19 +115,24 @@ st.markdown("""
         font-family: 'Courier New', monospace;
         white-space: pre-wrap;
     }
-    .warning-box {
-        background-color: #fff3cd;
-        border: 1px solid #ffc107;
-        padding: 1rem;
-        border-radius: 8px;
+    .url-input-container {
+        background: linear-gradient(135deg, #667eea15 0%, #764ba215 100%);
+        padding: 1.5rem;
+        border-radius: 12px;
+        border: 2px solid #667eea30;
         margin: 1rem 0;
     }
-    .stButton > button {
-        transition: all 0.3s;
+    .feature-card {
+        background: white;
+        padding: 1rem;
+        border-radius: 8px;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        margin: 0.5rem 0;
+        transition: transform 0.2s;
     }
-    .stButton > button:hover {
+    .feature-card:hover {
         transform: translateY(-2px);
-        box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        box-shadow: 0 4px 15px rgba(0,0,0,0.15);
     }
 </style>
 """, unsafe_allow_html=True)
@@ -122,31 +149,26 @@ def check_and_migrate_database():
     cursor = conn.cursor()
     
     try:
-        # Verifică dacă există coloanele noi în tabelul transcriptions
         cursor.execute("PRAGMA table_info(transcriptions)")
         columns = [column[1] for column in cursor.fetchall()]
         
-        # Adaugă coloanele lipsă
-        if 'source_language' not in columns:
-            cursor.execute("""
-                ALTER TABLE transcriptions 
-                ADD COLUMN source_language TEXT DEFAULT 'Auto-detect'
-            """)
-            conn.commit()
+        columns_to_add = {
+            'source_language': "TEXT DEFAULT 'Auto-detect'",
+            'target_language': "TEXT DEFAULT 'Română'",
+            'status': "TEXT DEFAULT 'completed'",
+            'file_size_mb': "REAL DEFAULT 0",
+            'process_method': "TEXT DEFAULT 'direct'",
+            'source_url': "TEXT",
+            'source_type': "TEXT DEFAULT 'upload'"
+        }
         
-        if 'target_language' not in columns:
-            cursor.execute("""
-                ALTER TABLE transcriptions 
-                ADD COLUMN target_language TEXT DEFAULT 'Română'
-            """)
-            conn.commit()
-        
-        if 'status' not in columns:
-            cursor.execute("""
-                ALTER TABLE transcriptions 
-                ADD COLUMN status TEXT DEFAULT 'completed'
-            """)
-            conn.commit()
+        for col_name, col_def in columns_to_add.items():
+            if col_name not in columns:
+                cursor.execute(f"""
+                    ALTER TABLE transcriptions 
+                    ADD COLUMN {col_name} {col_def}
+                """)
+                conn.commit()
             
     except Exception as e:
         pass
@@ -158,7 +180,6 @@ def init_database():
     conn = sqlite3.connect(str(DB_FILE))
     cursor = conn.cursor()
     
-    # Tabel pentru sesiuni
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS sessions (
             session_id TEXT PRIMARY KEY,
@@ -167,7 +188,6 @@ def init_database():
         )
     ''')
     
-    # Tabel pentru transcrieri - versiunea completă
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS transcriptions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -177,12 +197,15 @@ def init_database():
             target_language TEXT DEFAULT 'Română',
             transcription TEXT,
             status TEXT DEFAULT 'completed',
+            file_size_mb REAL DEFAULT 0,
+            process_method TEXT DEFAULT 'direct',
+            source_url TEXT,
+            source_type TEXT DEFAULT 'upload',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (session_id) REFERENCES sessions(session_id)
         )
     ''')
     
-    # Tabel pentru mesaje conversație
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -194,7 +217,6 @@ def init_database():
         )
     ''')
     
-    # Tabel pentru tracking chei API
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS api_key_usage (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -208,7 +230,6 @@ def init_database():
     conn.commit()
     conn.close()
     
-    # Verifică și migrează dacă e nevoie
     check_and_migrate_database()
 
 # ==================== SESSION MANAGEMENT ====================
@@ -217,16 +238,13 @@ def generate_session_id():
     return str(uuid.uuid4())[:8]
 
 def get_session_id_from_url():
-    """Obține session ID din query params"""
     params = st.query_params
     return params.get("session", None)
 
 def set_session_id_in_url(session_id):
-    """Setează session ID în URL"""
     st.query_params["session"] = session_id
 
 def init_session():
-    """Inițializează sau restaurează sesiunea"""
     url_session_id = get_session_id_from_url()
     
     if url_session_id and session_exists(url_session_id):
@@ -245,12 +263,8 @@ def init_session():
             st.session_state.messages = []
             st.session_state.transcriptions = []
             st.session_state.session_loaded = True
-    
-    if 'current_api_key_index' not in st.session_state:
-        st.session_state.current_api_key_index = 0
 
 def session_exists(session_id):
-    """Verifică dacă sesiunea există în DB"""
     try:
         conn = sqlite3.connect(str(DB_FILE))
         cursor = conn.cursor()
@@ -262,7 +276,6 @@ def session_exists(session_id):
         return False
 
 def create_session(session_id):
-    """Creează o sesiune nouă în DB"""
     try:
         conn = sqlite3.connect(str(DB_FILE))
         cursor = conn.cursor()
@@ -276,7 +289,6 @@ def create_session(session_id):
         st.error(f"Eroare la crearea sesiunii: {e}")
 
 def delete_session_data(session_id):
-    """Șterge toate datele unei sesiuni"""
     try:
         conn = sqlite3.connect(str(DB_FILE))
         cursor = conn.cursor()
@@ -290,12 +302,11 @@ def delete_session_data(session_id):
 # ==================== API KEY MANAGEMENT ====================
 
 def get_api_keys_from_secrets():
-    """Obține cheile API din Streamlit secrets"""
     keys = []
     
     try:
-        if "GOOGLE_API_KEYS" in st.secrets:
-            secret_keys = st.secrets["GOOGLE_API_KEYS"]
+        if "GEMINI_API_KEYS" in st.secrets:
+            secret_keys = st.secrets["GEMINI_API_KEYS"]
             if isinstance(secret_keys, list):
                 keys.extend(secret_keys)
             elif isinstance(secret_keys, str):
@@ -312,7 +323,6 @@ def get_api_keys_from_secrets():
     return keys
 
 def test_api_key(api_key):
-    """Testează dacă o cheie API funcționează"""
     try:
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel('gemini-1.5-flash')
@@ -322,13 +332,12 @@ def test_api_key(api_key):
         error_msg = str(e)
         if "quota" in error_msg.lower() or "billing" in error_msg.lower():
             return False, "❌ Cheie expirată (quota/billing)"
-        elif "api key" in error_msg.lower() or "api_key" in error_msg.lower():
+        elif "api key" in error_msg.lower():
             return False, "❌ Cheie invalidă"
         else:
             return False, f"❌ Eroare: {error_msg[:100]}"
 
 def get_working_api_key(keys):
-    """Găsește prima cheie funcțională din listă"""
     if not keys:
         return None, None, "Nu există chei API configurate"
     
@@ -336,29 +345,12 @@ def get_working_api_key(keys):
         valid, msg = test_api_key(key)
         if valid:
             return key, i, msg
-        
-        log_api_key_usage(i, "failed", msg)
     
     return None, None, "Toate cheile API sunt expirate sau invalide"
-
-def log_api_key_usage(key_index, status, error_msg=None):
-    """Loghează folosirea unei chei API"""
-    try:
-        conn = sqlite3.connect(str(DB_FILE))
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO api_key_usage (key_index, status, error_message) VALUES (?, ?, ?)",
-            (key_index, status, error_msg)
-        )
-        conn.commit()
-        conn.close()
-    except:
-        pass
 
 # ==================== DATABASE OPERATIONS ====================
 
 def save_message(session_id, role, content):
-    """Salvează un mesaj în conversație"""
     try:
         conn = sqlite3.connect(str(DB_FILE))
         cursor = conn.cursor()
@@ -372,7 +364,6 @@ def save_message(session_id, role, content):
         st.error(f"Eroare salvare mesaj: {e}")
 
 def get_messages(session_id):
-    """Obține mesajele unei sesiuni"""
     try:
         conn = sqlite3.connect(str(DB_FILE))
         cursor = conn.cursor()
@@ -386,29 +377,19 @@ def get_messages(session_id):
     except:
         return []
 
-def save_transcription(session_id, video_name, source_lang, target_lang, transcription):
-    """Salvează o transcriere"""
+def save_transcription(session_id, video_name, source_lang, target_lang, transcription, 
+                       file_size_mb=0, process_method="direct", source_url="", source_type="upload"):
     try:
         conn = sqlite3.connect(str(DB_FILE))
         cursor = conn.cursor()
         
-        cursor.execute("PRAGMA table_info(transcriptions)")
-        columns = [column[1] for column in cursor.fetchall()]
-        
-        if 'source_language' in columns and 'target_language' in columns:
-            cursor.execute(
-                '''INSERT INTO transcriptions 
-                   (session_id, video_name, source_language, target_language, transcription, status) 
-                   VALUES (?, ?, ?, ?, ?, ?)''',
-                (session_id, video_name, source_lang, target_lang, transcription, 'completed')
-            )
-        else:
-            cursor.execute(
-                '''INSERT INTO transcriptions 
-                   (session_id, video_name, transcription) 
-                   VALUES (?, ?, ?)''',
-                (session_id, video_name, transcription)
-            )
+        cursor.execute('''
+            INSERT INTO transcriptions 
+            (session_id, video_name, source_language, target_language, transcription, 
+             status, file_size_mb, process_method, source_url, source_type) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (session_id, video_name, source_lang, target_lang, transcription, 
+              'completed', file_size_mb, process_method, source_url, source_type))
         
         conn.commit()
         transcription_id = cursor.lastrowid
@@ -419,55 +400,34 @@ def save_transcription(session_id, video_name, source_lang, target_lang, transcr
         return None
 
 def get_transcriptions(session_id):
-    """Obține transcrierile unei sesiuni"""
     try:
         conn = sqlite3.connect(str(DB_FILE))
         cursor = conn.cursor()
         
-        cursor.execute("PRAGMA table_info(transcriptions)")
-        columns = [column[1] for column in cursor.fetchall()]
+        cursor.execute('''
+            SELECT id, video_name, source_language, target_language, 
+                   transcription, status, file_size_mb, process_method,
+                   source_url, source_type, created_at 
+            FROM transcriptions 
+            WHERE session_id = ? 
+            ORDER BY created_at DESC
+        ''', (session_id,))
         
-        if 'source_language' in columns and 'target_language' in columns:
-            cursor.execute(
-                '''SELECT id, video_name, source_language, target_language, 
-                   transcription, status, created_at 
-                   FROM transcriptions 
-                   WHERE session_id = ? 
-                   ORDER BY created_at DESC''',
-                (session_id,)
-            )
-            
-            transcriptions = []
-            for row in cursor.fetchall():
-                transcriptions.append({
-                    "id": row[0],
-                    "video_name": row[1],
-                    "source_language": row[2],
-                    "target_language": row[3],
-                    "transcription": row[4],
-                    "status": row[5],
-                    "created_at": row[6]
-                })
-        else:
-            cursor.execute(
-                '''SELECT id, video_name, transcription, created_at 
-                   FROM transcriptions 
-                   WHERE session_id = ? 
-                   ORDER BY created_at DESC''',
-                (session_id,)
-            )
-            
-            transcriptions = []
-            for row in cursor.fetchall():
-                transcriptions.append({
-                    "id": row[0],
-                    "video_name": row[1],
-                    "source_language": "Auto-detect",
-                    "target_language": "Română",
-                    "transcription": row[2],
-                    "status": "completed",
-                    "created_at": row[3]
-                })
+        transcriptions = []
+        for row in cursor.fetchall():
+            transcriptions.append({
+                "id": row[0],
+                "video_name": row[1],
+                "source_language": row[2],
+                "target_language": row[3],
+                "transcription": row[4],
+                "status": row[5],
+                "file_size_mb": row[6],
+                "process_method": row[7],
+                "source_url": row[8],
+                "source_type": row[9],
+                "created_at": row[10]
+            })
         
         conn.close()
         return transcriptions
@@ -475,9 +435,263 @@ def get_transcriptions(session_id):
         st.error(f"Eroare citire transcrieri: {e}")
         return []
 
+# ==================== URL PROCESSING ====================
+
+def extract_video_id_youtube(url):
+    """Extrage ID-ul video din URL YouTube"""
+    patterns = [
+        r'(?:youtube\.com\/watch\?v=)([\w-]+)',
+        r'(?:youtu\.be\/)([\w-]+)',
+        r'(?:youtube\.com\/embed\/)([\w-]+)',
+        r'(?:youtube\.com\/v\/)([\w-]+)'
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+def extract_file_id_gdrive(url):
+    """Extrage ID-ul fișierului din URL Google Drive"""
+    patterns = [
+        r'(?:drive\.google\.com\/file\/d\/)([\w-]+)',
+        r'(?:drive\.google\.com\/open\?id=)([\w-]+)',
+        r'(?:docs\.google\.com\/.*\/d\/)([\w-]+)',
+        r'(?:drive\.google\.com\/uc\?id=)([\w-]+)'
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+def detect_url_type(url):
+    """Detectează tipul URL-ului"""
+    if not url:
+        return None
+    
+    url_lower = url.lower()
+    
+    if 'youtube.com' in url_lower or 'youtu.be' in url_lower:
+        return 'youtube'
+    elif 'drive.google.com' in url_lower or 'docs.google.com' in url_lower:
+        return 'gdrive'
+    elif url_lower.startswith('http://') or url_lower.startswith('https://'):
+        # Verifică dacă e link direct către video
+        video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv', '.wmv']
+        for ext in video_extensions:
+            if ext in url_lower:
+                return 'direct'
+        return 'other'
+    
+    return None
+
+def get_youtube_info(video_id):
+    """Obține informații despre video YouTube"""
+    if not YTDLP_AVAILABLE:
+        return None, "yt-dlp nu este instalat"
+    
+    try:
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': True
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+            
+            return {
+                'title': info.get('title', 'Unknown'),
+                'duration': info.get('duration', 0),
+                'uploader': info.get('uploader', 'Unknown'),
+                'view_count': info.get('view_count', 0),
+                'description': info.get('description', '')[:500]
+            }, None
+    except Exception as e:
+        return None, str(e)
+
+def download_youtube_video(video_id, max_size_mb=200, progress_callback=None):
+    """Descarcă video YouTube"""
+    if not YTDLP_AVAILABLE:
+        return None, None, "yt-dlp nu este instalat"
+    
+    try:
+        output_path = tempfile.mktemp(suffix='.mp4')
+        
+        if progress_callback:
+            progress_callback(0.1, "📥 Descărcare video YouTube...")
+        
+        ydl_opts = {
+            'format': f'best[filesize<{max_size_mb}M]/bestvideo[filesize<{max_size_mb}M]+bestaudio/best',
+            'outtmpl': output_path,
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': False,
+            'postprocessors': [{
+                'key': 'FFmpegVideoConvertor',
+                'preferedformat': 'mp4'
+            }]
+        }
+        
+        # Încearcă descărcarea cu limite de calitate descrescătoare
+        quality_formats = [
+            f'best[height<=720][filesize<{max_size_mb}M]',
+            f'best[height<=480][filesize<{max_size_mb}M]', 
+            f'worst[filesize<{max_size_mb}M]'
+        ]
+        
+        for format_spec in quality_formats:
+            try:
+                ydl_opts['format'] = format_spec
+                
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
+                    
+                    if os.path.exists(output_path):
+                        file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                        
+                        if progress_callback:
+                            progress_callback(0.5, f"✅ Video descărcat ({file_size_mb:.1f}MB)")
+                        
+                        return output_path, info.get('title', 'YouTube Video'), None
+                    
+            except Exception as e:
+                continue
+        
+        # Dacă nu merge cu video, încearcă doar audio
+        if progress_callback:
+            progress_callback(0.3, "🎵 Încerc doar audio...")
+        
+        audio_path = tempfile.mktemp(suffix='.m4a')
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'outtmpl': audio_path,
+            'quiet': True,
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'm4a',
+                'preferredquality': '128'
+            }]
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
+            
+            if os.path.exists(audio_path):
+                if progress_callback:
+                    progress_callback(0.7, "✅ Audio descărcat")
+                
+                return audio_path, info.get('title', 'YouTube Audio'), 'audio_only'
+        
+        return None, None, "Nu s-a putut descărca video/audio"
+        
+    except Exception as e:
+        return None, None, f"Eroare descărcare: {str(e)}"
+
+def download_gdrive_video(file_id, progress_callback=None):
+    """Descarcă video de pe Google Drive"""
+    try:
+        if progress_callback:
+            progress_callback(0.1, "📥 Descărcare de pe Google Drive...")
+        
+        # URL pentru descărcare directă
+        download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+        
+        # Încearcă descărcarea
+        response = requests.get(download_url, stream=True)
+        
+        # Verifică pentru confirmare (fișiere mari)
+        if 'download_warning' in response.content.decode():
+            # Extrage token pentru confirmare
+            token = None
+            for line in response.content.decode().split('\n'):
+                if 'download_warning' in line:
+                    match = re.search(r'download_warning.*?=([^&]+)', line)
+                    if match:
+                        token = match.group(1)
+                        break
+            
+            if token:
+                download_url = f"https://drive.google.com/uc?export=download&confirm={token}&id={file_id}"
+                response = requests.get(download_url, stream=True)
+        
+        if response.status_code == 200:
+            # Salvează fișierul
+            output_path = tempfile.mktemp(suffix='.mp4')
+            
+            total_size = int(response.headers.get('content-length', 0))
+            downloaded = 0
+            
+            with open(output_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        
+                        if progress_callback and total_size > 0:
+                            progress = 0.1 + (0.8 * downloaded / total_size)
+                            progress_callback(progress, f"📥 Descărcat {downloaded/(1024*1024):.1f}MB")
+            
+            file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+            
+            if progress_callback:
+                progress_callback(0.9, f"✅ Descărcat ({file_size_mb:.1f}MB)")
+            
+            return output_path, f"GDrive_{file_id[:8]}.mp4", None
+        else:
+            return None, None, f"Eroare HTTP: {response.status_code}"
+            
+    except Exception as e:
+        return None, None, f"Eroare descărcare GDrive: {str(e)}"
+
+def download_direct_video(url, progress_callback=None):
+    """Descarcă video de la URL direct"""
+    try:
+        if progress_callback:
+            progress_callback(0.1, "📥 Descărcare video...")
+        
+        response = requests.get(url, stream=True)
+        
+        if response.status_code == 200:
+            # Determină extensia
+            content_type = response.headers.get('content-type', '')
+            ext = '.mp4'
+            if 'video/' in content_type:
+                ext = '.' + content_type.split('/')[-1].split(';')[0]
+            
+            output_path = tempfile.mktemp(suffix=ext)
+            
+            total_size = int(response.headers.get('content-length', 0))
+            downloaded = 0
+            
+            with open(output_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        
+                        if progress_callback and total_size > 0:
+                            progress = 0.1 + (0.8 * downloaded / total_size)
+                            progress_callback(progress, f"📥 {downloaded/(1024*1024):.1f}/{total_size/(1024*1024):.1f}MB")
+            
+            file_name = url.split('/')[-1].split('?')[0] or 'direct_video.mp4'
+            
+            if progress_callback:
+                progress_callback(0.9, "✅ Video descărcat")
+            
+            return output_path, file_name, None
+        else:
+            return None, None, f"Eroare HTTP: {response.status_code}"
+            
+    except Exception as e:
+        return None, None, f"Eroare descărcare: {str(e)}"
+
 # ==================== VIDEO PROCESSING ====================
 
-SUPPORTED_FORMATS = ['mp4', 'mpeg', 'mov', 'avi', 'mkv', 'webm', 'flv', 'wmv']
+SUPPORTED_FORMATS = ['mp4', 'mpeg', 'mov', 'avi', 'mkv', 'webm', 'flv', 'wmv', '3gp', 'ogv']
 
 LANGUAGES = {
     "Română": "Romanian",
@@ -497,131 +711,148 @@ LANGUAGES = {
     "Auto-detect": "auto"
 }
 
-def validate_file_size(file):
-    """Validează dimensiunea fișierului"""
-    file_size_mb = file.size / (1024 * 1024)
-    return file_size_mb <= MAX_FILE_SIZE_MB, file_size_mb
-
-def upload_video_to_gemini(video_path, progress_callback=None):
-    """Încarcă video pe serverele Google"""
+def process_and_transcribe(file_path, source_lang, target_lang, api_key, 
+                           file_size_mb=0, progress_callback=None, is_audio_only=False):
+    """Procesează și transcrie fișierul video/audio"""
     try:
-        if progress_callback:
-            progress_callback(0.3, "📤 Încărcare video pe serverele Google...")
-        
-        # Verifică dimensiunea fișierului
-        file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
-        if file_size_mb > MAX_FILE_SIZE_MB:
-            return None, f"❌ Fișierul este prea mare ({file_size_mb:.1f}MB). Limita este {MAX_FILE_SIZE_MB}MB"
-        
-        # Upload fișier
-        video_file = genai.upload_file(path=video_path)
-        
-        if progress_callback:
-            progress_callback(0.5, "⏳ Procesare video...")
-        
-        # Așteaptă procesarea
-        max_wait = 120  # maxim 2 minute
-        wait_time = 0
-        while video_file.state.name == "PROCESSING" and wait_time < max_wait:
-            time.sleep(2)
-            wait_time += 2
-            video_file = genai.get_file(video_file.name)
-            
-            if progress_callback:
-                progress = 0.5 + (0.2 * (wait_time / max_wait))
-                progress_callback(progress, f"⏳ Procesare video... ({wait_time}s)")
-        
-        if video_file.state.name == "FAILED":
-            return None, "❌ Procesarea video a eșuat. Încercați un fișier mai mic sau alt format."
-        
-        if wait_time >= max_wait:
-            return None, "❌ Timeout la procesarea video. Încercați un fișier mai mic."
-        
-        if progress_callback:
-            progress_callback(0.7, "✅ Video încărcat cu succes!")
-        
-        return video_file, None
-        
-    except Exception as e:
-        error_msg = str(e)
-        if "size" in error_msg.lower() or "too large" in error_msg.lower():
-            return None, f"❌ Fișierul este prea mare. Limita maximă este {MAX_FILE_SIZE_MB}MB"
-        return None, f"❌ Eroare upload: {error_msg}"
-
-def transcribe_video(video_file, source_lang, target_lang, api_key, progress_callback=None):
-    """Transcrie video folosind Gemini"""
-    try:
-        if progress_callback:
-            progress_callback(0.8, "🤖 Transcriere cu AI...")
-        
         genai.configure(api_key=api_key)
         
-        # Folosește modelul potrivit în funcție de durată
-        # gemini-1.5-flash pentru videouri scurte (mai rapid)
-        # gemini-1.5-pro pentru videouri lungi (mai precis)
-        model = genai.GenerativeModel('gemini-1.5-pro')
-        
-        # Construiește prompt
-        source = LANGUAGES.get(source_lang, "auto")
-        target = LANGUAGES.get(target_lang, "Romanian")
-        
-        prompt = f"""
+        if is_audio_only:
+            # Pentru fișiere audio
+            if progress_callback:
+                progress_callback(0.3, "🎵 Procesare fișier audio...")
+            
+            audio_file = genai.upload_file(path=file_path)
+            
+            if progress_callback:
+                progress_callback(0.5, "⏳ Așteptare procesare...")
+            
+            # Așteaptă procesarea
+            max_wait = 60
+            wait_time = 0
+            while audio_file.state.name == "PROCESSING" and wait_time < max_wait:
+                time.sleep(2)
+                wait_time += 2
+                audio_file = genai.get_file(audio_file.name)
+            
+            if audio_file.state.name == "FAILED":
+                return None, "❌ Procesarea audio a eșuat"
+            
+            if progress_callback:
+                progress_callback(0.7, "🤖 Transcriere audio...")
+            
+            model = genai.GenerativeModel('gemini-1.5-pro')
+            
+            source = LANGUAGES.get(source_lang, "auto")
+            target = LANGUAGES.get(target_lang, "Romanian")
+            
+            prompt = f"""
+Transcrie complet acest fișier audio.
+
+INSTRUCȚIUNI:
+1. Limba sursă: {source}
+2. Limba țintă: {target}
+3. Transcrie TOT conținutul
+4. Include timestamps aproximative [MM:SS]
+5. {'TRADUCE în ' + target if source != target and source != 'auto' else 'Menține limba originală'}
+
+Formatare:
+[MM:SS] Text transcris
+"""
+            
+            response = model.generate_content([audio_file, prompt])
+            
+            # Cleanup
+            genai.delete_file(audio_file.name)
+            
+            if progress_callback:
+                progress_callback(1.0, "✅ Transcriere completă!")
+            
+            return response.text, None
+            
+        else:
+            # Pentru fișiere video
+            if file_size_mb > GEMINI_DIRECT_UPLOAD_LIMIT_MB:
+                return None, f"❌ Fișier prea mare ({file_size_mb:.1f}MB). Limita: {GEMINI_DIRECT_UPLOAD_LIMIT_MB}MB"
+            
+            if progress_callback:
+                progress_callback(0.3, "📤 Încărcare video...")
+            
+            video_file = genai.upload_file(path=file_path)
+            
+            if progress_callback:
+                progress_callback(0.5, "⏳ Procesare video...")
+            
+            # Așteaptă procesarea
+            max_wait = 180
+            wait_time = 0
+            while video_file.state.name == "PROCESSING" and wait_time < max_wait:
+                time.sleep(2)
+                wait_time += 2
+                video_file = genai.get_file(video_file.name)
+                
+                if progress_callback:
+                    progress = 0.5 + (0.2 * (wait_time / max_wait))
+                    progress_callback(progress, f"⏳ Procesare... ({wait_time}s)")
+            
+            if video_file.state.name == "FAILED":
+                return None, "❌ Procesarea video a eșuat"
+            
+            if progress_callback:
+                progress_callback(0.8, "🤖 Transcriere video...")
+            
+            model = genai.GenerativeModel('gemini-1.5-pro')
+            
+            source = LANGUAGES.get(source_lang, "auto")
+            target = LANGUAGES.get(target_lang, "Romanian")
+            
+            prompt = f"""
 Analizează acest video și transcrie tot conținutul audio/vocal.
 
 INSTRUCȚIUNI:
-1. Limba sursă: {source} {'(detectează automat limba vorbită)' if source == 'auto' else ''}
-2. Limba țintă pentru transcriere: {target}
-3. Transcrie COMPLET tot ce se vorbește
-4. Include timestamps pentru fiecare segment important
-5. {'TRADUCE în ' + target if source != target and source != 'auto' else 'Păstrează limba originală'}
-6. Formatează clar și profesional
+1. Limba sursă: {source} {'(detectează automat)' if source == 'auto' else ''}
+2. Limba țintă: {target}
+3. Transcrie COMPLET tot dialogul
+4. Include timestamps [MM:SS]
+5. {'TRADUCE în ' + target if source != target and source != 'auto' else 'Menține limba originală'}
+6. Notează și sunete/muzică relevante între [paranteze]
 
-FORMAT DORIT:
-[MM:SS] - Text transcris
-[MM:SS] - Continuare text...
-
-Începe transcrierea:
+FORMAT:
+[MM:SS] Text transcris
+[MM:SS] [muzică de fundal]
+[MM:SS] Continuare dialog...
 """
-        
-        # Generează cu timeout mai mare pentru videouri mari
-        generation_config = genai.types.GenerationConfig(
-            temperature=0.3,
-            max_output_tokens=8192,
-        )
-        
-        response = model.generate_content(
-            [video_file, prompt],
-            generation_config=generation_config,
-            request_options={"timeout": 600}  # 10 minute timeout
-        )
-        
-        if progress_callback:
-            progress_callback(1.0, "✅ Transcriere completă!")
-        
-        return response.text, None
-        
+            
+            generation_config = genai.types.GenerationConfig(
+                temperature=0.3,
+                max_output_tokens=8192,
+            )
+            
+            response = model.generate_content(
+                [video_file, prompt],
+                generation_config=generation_config,
+                request_options={"timeout": 600}
+            )
+            
+            # Cleanup
+            genai.delete_file(video_file.name)
+            
+            if progress_callback:
+                progress_callback(1.0, "✅ Transcriere completă!")
+            
+            return response.text, None
+            
     except Exception as e:
         error_msg = str(e)
         if "quota" in error_msg.lower():
-            return None, "❌ Quota API depășită pentru această cheie"
-        elif "timeout" in error_msg.lower():
-            return None, "❌ Timeout - videoul este prea lung. Încercați cu un video mai scurt."
-        elif "size" in error_msg.lower():
-            return None, f"❌ Videoul depășește limita. Maxim {MAX_FILE_SIZE_MB}MB"
+            return None, "❌ Quota API depășită"
         else:
-            return None, f"❌ Eroare transcriere: {error_msg}"
-
-def cleanup_video_file(video_file):
-    """Șterge video de pe serverele Google"""
-    try:
-        genai.delete_file(video_file.name)
-    except:
-        pass
+            return None, f"❌ Eroare procesare: {error_msg}"
 
 # ==================== WORD EXPORT ====================
 
-def create_word_document(transcription, video_name, source_lang, target_lang):
-    """Creează document Word cu transcrierea"""
+def create_word_document(transcription, video_name, source_lang, target_lang, 
+                        file_size_mb=0, source_type="upload", source_url=""):
     if not DOCX_AVAILABLE:
         return None
     
@@ -635,6 +866,16 @@ def create_word_document(transcription, video_name, source_lang, target_lang):
         info = doc.add_paragraph()
         info.add_run('Informații Document\n').bold = True
         info.add_run(f'📹 Video: {video_name}\n')
+        
+        if source_type != 'upload':
+            source_icon = {'youtube': '🎬', 'gdrive': '☁️', 'direct': '🔗'}.get(source_type, '📎')
+            info.add_run(f'{source_icon} Sursă: {source_type.upper()}\n')
+            if source_url:
+                info.add_run(f'🔗 URL: {source_url[:50]}...\n' if len(source_url) > 50 else f'🔗 URL: {source_url}\n')
+        
+        if file_size_mb > 0:
+            info.add_run(f'📊 Dimensiune: {file_size_mb:.1f}MB\n')
+        
         info.add_run(f'🌐 Limba sursă: {source_lang}\n')
         info.add_run(f'🎯 Limba țintă: {target_lang}\n')
         info.add_run(f'📅 Data: {datetime.now().strftime("%d.%m.%Y %H:%M")}\n')
@@ -660,13 +901,12 @@ def create_word_document(transcription, video_name, source_lang, target_lang):
         
         return doc_io
     except Exception as e:
-        st.error(f"Eroare creare document Word: {e}")
+        st.error(f"Eroare creare document: {e}")
         return None
 
 # ==================== UI COMPONENTS ====================
 
 def render_sidebar():
-    """Sidebar cu configurări"""
     with st.sidebar:
         st.markdown("## ⚙️ Configurare")
         
@@ -675,270 +915,371 @@ def render_sidebar():
             <strong>📋 ID Sesiune:</strong> {st.session_state.session_id}<br>
             <strong>🔗 Link permanent:</strong><br>
             <code>?session={st.session_state.session_id}</code><br>
-            <small>💡 Salvează acest link pentru a reveni la conversație</small>
+            <small>💡 Salvează pentru a reveni</small>
         </div>
         """, unsafe_allow_html=True)
         
-        st.markdown("### 🔑 Status Chei API")
+        st.markdown("### 🔑 Chei API")
         
         keys = get_api_keys_from_secrets()
         
         if not keys:
-            st.error("❌ Nu există chei API în Secrets!")
-            st.markdown("""
-            **Configurare în Streamlit Cloud:**
-            1. Settings → Secrets
-            2. Adaugă:
-            ```
-            GOOGLE_API_KEYS = ["key1", "key2"]
-            # sau
-            GEMINI_API_KEY = "your-key"
-            ```
-            """)
-            
-            st.markdown("---")
-            st.markdown("**SAU** adaugă temporar aici:")
-            temp_key = st.text_input("Cheie API temporară:", type="password", key="temp_api_input")
-            if st.button("Testează și folosește", key="test_api_btn"):
+            st.error("❌ Fără chei în Secrets!")
+            st.markdown("**Adaugă temporar:**")
+            temp_key = st.text_input("API Key:", type="password", key="temp_api")
+            if st.button("Adaugă", key="add_temp"):
                 if temp_key:
                     valid, msg = test_api_key(temp_key)
                     if valid:
                         if 'temp_api_keys' not in st.session_state:
                             st.session_state.temp_api_keys = []
                         st.session_state.temp_api_keys.append(temp_key)
-                        st.success("✅ Cheie adăugată temporar!")
+                        st.success("✅ Adăugată!")
                         st.rerun()
                     else:
                         st.error(msg)
         else:
-            st.success(f"✅ {len(keys)} chei disponibile din Secrets")
-            
-            if st.button("🔄 Testează toate cheile", key="test_all_keys"):
-                with st.spinner("Testare..."):
-                    for i, key in enumerate(keys):
-                        valid, msg = test_api_key(key)
-                        if valid:
-                            st.success(f"Cheie {i+1}: {msg}")
-                        else:
-                            st.error(f"Cheie {i+1}: {msg}")
+            st.success(f"✅ {len(keys)} chei")
         
-        if 'temp_api_keys' in st.session_state and st.session_state.temp_api_keys:
-            st.info(f"📌 {len(st.session_state.temp_api_keys)} chei temporare active")
+        if 'temp_api_keys' in st.session_state:
+            st.info(f"📌 {len(st.session_state.temp_api_keys)} temporare")
         
         st.markdown("---")
         
-        # Info limită fișier
-        st.markdown(f"""
+        # Capabilități
+        st.markdown("""
         <div class="warning-box">
-            <strong>⚠️ Limite fișiere:</strong><br>
-            • Maxim {MAX_FILE_SIZE_MB}MB per video<br>
-            • Formate: {', '.join(SUPPORTED_FORMATS[:5])}...<br>
-            • Videouri lungi pot dura mai mult
+            <strong>✨ Surse Suportate:</strong><br>
+            • 🎬 YouTube (max 2h)<br>
+            • ☁️ Google Drive<br>
+            • 🔗 Link direct video<br>
+            • 📤 Upload (max 200MB)<br>
         </div>
         """, unsafe_allow_html=True)
+        
+        # Status biblioteci
+        with st.expander("📚 Status biblioteci"):
+            libs = {
+                "Gemini AI": GEMINI_AVAILABLE,
+                "yt-dlp": YTDLP_AVAILABLE,
+                "Google API": GDRIVE_AVAILABLE,
+                "python-docx": DOCX_AVAILABLE
+            }
+            
+            for lib, status in libs.items():
+                if status:
+                    st.success(f"✅ {lib}")
+                else:
+                    st.warning(f"⚠️ {lib}")
         
         st.markdown("---")
         
         col1, col2 = st.columns(2)
-        
         with col1:
-            if st.button("🔄 Reset conversație", use_container_width=True, key="reset_conv"):
+            if st.button("🔄 Reset", use_container_width=True):
                 delete_session_data(st.session_state.session_id)
                 st.session_state.messages = []
                 st.session_state.transcriptions = []
-                st.success("✅ Date resetate!")
+                st.success("✅ Resetat!")
                 st.rerun()
         
         with col2:
-            if st.button("🆕 Sesiune nouă", use_container_width=True, key="new_session"):
+            if st.button("🆕 Nou", use_container_width=True):
                 new_id = generate_session_id()
                 create_session(new_id)
                 st.session_state.session_id = new_id
                 st.session_state.messages = []
                 st.session_state.transcriptions = []
                 st.session_state.session_loaded = True
-                if 'temp_api_keys' in st.session_state:
-                    del st.session_state.temp_api_keys
                 set_session_id_in_url(new_id)
                 st.rerun()
 
 def render_upload_tab():
-    """Tab pentru upload video"""
+    # Selector tip input
+    input_type = st.radio(
+        "🎯 Alege sursa video:",
+        ["📤 Upload Fișier", "🔗 URL/Link", "🎬 YouTube", "☁️ Google Drive"],
+        horizontal=True,
+        key="input_type"
+    )
+    
+    st.markdown("---")
+    
     col1, col2 = st.columns([2, 1])
     
     with col1:
-        st.markdown("### 📤 Încarcă Video")
+        video_source = None
+        video_info = {}
         
-        # File uploader cu limită specificată
-        uploaded_file = st.file_uploader(
-            f"Selectează fișier video (max {MAX_FILE_SIZE_MB}MB)",
-            type=SUPPORTED_FORMATS,
-            help=f"Formate suportate: {', '.join(SUPPORTED_FORMATS)}. Limită: {MAX_FILE_SIZE_MB}MB",
-            key="video_uploader"
-        )
-        
-        if uploaded_file:
-            # Validează dimensiunea
-            is_valid, file_size_mb = validate_file_size(uploaded_file)
+        if input_type == "📤 Upload Fișier":
+            st.markdown("### 📤 Încarcă Video")
             
-            if not is_valid:
-                st.error(f"""
-                ❌ **Fișierul este prea mare!**
-                • Dimensiune: {file_size_mb:.1f}MB
-                • Limită maximă: {MAX_FILE_SIZE_MB}MB
-                • Sugestii: Comprimați videoul sau folosiți un serviciu de compresie online
-                """)
+            uploaded_file = st.file_uploader(
+                f"Selectează video (max {GEMINI_DIRECT_UPLOAD_LIMIT_MB}MB)",
+                type=SUPPORTED_FORMATS,
+                key="file_upload"
+            )
+            
+            if uploaded_file:
+                file_size_mb = uploaded_file.size / (1024 * 1024)
                 
-                # Sugestii pentru compresie
-                with st.expander("💡 Cum să reduci dimensiunea video-ului"):
-                    st.markdown("""
-                    **Opțiuni pentru reducerea dimensiunii:**
-                    
-                    1. **Online (gratuit):**
-                       - [CloudConvert](https://cloudconvert.com/video-compressor)
-                       - [FreeConvert](https://www.freeconvert.com/video-compressor)
-                       - [Clideo](https://clideo.com/compress-video)
-                    
-                    2. **Software desktop:**
-                       - HandBrake (gratuit, toate platformele)
-                       - VLC Media Player (gratuit)
-                    
-                    3. **Comenzi FFmpeg:**
-                       ```bash
-                       ffmpeg -i input.mp4 -vcodec h264 -acodec mp3 output.mp4
-                       ```
-                    
-                    4. **Sfaturi:**
-                       - Reduceți rezoluția (ex: 1080p → 720p)
-                       - Reduceți bitrate-ul
-                       - Tăiați părțile nenecesare
-                    """)
-                return
+                if file_size_mb > GEMINI_DIRECT_UPLOAD_LIMIT_MB:
+                    st.error(f"❌ Prea mare: {file_size_mb:.1f}MB (max {GEMINI_DIRECT_UPLOAD_LIMIT_MB}MB)")
+                else:
+                    st.success(f"✅ {uploaded_file.name} ({file_size_mb:.1f}MB)")
+                    if file_size_mb <= 50:
+                        st.video(uploaded_file)
+                    video_source = ('upload', uploaded_file, file_size_mb)
+        
+        elif input_type == "🔗 URL/Link":
+            st.markdown("### 🔗 URL Video Direct")
             
-            # Afișează video și info
-            st.video(uploaded_file)
+            video_url = st.text_input(
+                "Introdu URL video direct:",
+                placeholder="https://example.com/video.mp4",
+                key="direct_url"
+            )
             
-            # Info despre fișier
-            col_info1, col_info2 = st.columns(2)
-            with col_info1:
-                st.success(f"✅ **Dimensiune OK:** {file_size_mb:.1f}MB")
-            with col_info2:
-                st.info(f"📁 **Nume:** {uploaded_file.name}")
+            if video_url:
+                url_type = detect_url_type(video_url)
+                
+                if url_type == 'youtube':
+                    st.info("💡 Folosește tab-ul YouTube pentru link-uri YouTube")
+                elif url_type == 'gdrive':
+                    st.info("💡 Folosește tab-ul Google Drive pentru link-uri Drive")
+                elif url_type == 'direct':
+                    st.success(f"✅ Link video detectat")
+                    video_source = ('direct', video_url, 0)
+                else:
+                    st.warning("⚠️ Verifică să fie un link direct către fișier video")
+        
+        elif input_type == "🎬 YouTube":
+            st.markdown("### 🎬 YouTube Video")
+            
+            youtube_url = st.text_input(
+                "URL sau ID video YouTube:",
+                placeholder="https://www.youtube.com/watch?v=... sau ID video",
+                key="youtube_url"
+            )
+            
+            if youtube_url:
+                # Extrage ID
+                if 'youtube.com' in youtube_url or 'youtu.be' in youtube_url:
+                    video_id = extract_video_id_youtube(youtube_url)
+                else:
+                    video_id = youtube_url.strip()
+                
+                if video_id:
+                    st.success(f"✅ Video ID: {video_id}")
+                    
+                    # Info video
+                    with st.spinner("Obțin informații..."):
+                        info, error = get_youtube_info(video_id)
+                        
+                        if info:
+                            st.markdown(f"""
+                            <div class="feature-card">
+                                <strong>📹 {info['title']}</strong><br>
+                                👤 {info['uploader']}<br>
+                                ⏱️ {info['duration']//60}:{info['duration']%60:02d}<br>
+                                👁️ {info['view_count']:,} vizualizări
+                            </div>
+                            """, unsafe_allow_html=True)
+                            
+                            if info['duration'] > YOUTUBE_MAX_DURATION_MINUTES * 60:
+                                st.warning(f"⚠️ Video prea lung ({info['duration']//60} min). Max: {YOUTUBE_MAX_DURATION_MINUTES} min")
+                            else:
+                                video_source = ('youtube', video_id, 0)
+                                video_info = info
+                        elif not YTDLP_AVAILABLE:
+                            st.error("❌ yt-dlp nu este instalat. Adaugă în requirements.txt")
+                            video_source = ('youtube', video_id, 0)  # Încearcă oricum
+                        else:
+                            st.error(f"❌ Eroare: {error}")
+                else:
+                    st.error("❌ Nu am putut extrage ID-ul video")
+        
+        elif input_type == "☁️ Google Drive":
+            st.markdown("### ☁️ Google Drive")
+            
+            gdrive_url = st.text_input(
+                "URL Google Drive:",
+                placeholder="https://drive.google.com/file/d/.../view",
+                key="gdrive_url"
+            )
+            
+            if gdrive_url:
+                file_id = extract_file_id_gdrive(gdrive_url)
+                
+                if file_id:
+                    st.success(f"✅ File ID: {file_id[:20]}...")
+                    st.info("📌 Asigură-te că fișierul este public sau 'Anyone with link'")
+                    video_source = ('gdrive', file_id, 0)
+                else:
+                    st.error("❌ Nu am putut extrage ID-ul fișierului")
     
     with col2:
         st.markdown("### 🌐 Setări Limbă")
         
         source_lang = st.selectbox(
-            "Limba sursă (din video)",
+            "Limba sursă",
             options=list(LANGUAGES.keys()),
             index=list(LANGUAGES.keys()).index("Auto-detect"),
-            key="source_lang"
+            key="src_lang"
         )
         
         target_lang = st.selectbox(
-            "Limba țintă (transcriere)",
+            "Limba țintă",
             options=[k for k in LANGUAGES.keys() if k != "Auto-detect"],
-            index=0,  # Română
-            key="target_lang"
+            index=0,
+            key="tgt_lang"
         )
         
-        # Estimare timp procesare
-        if uploaded_file:
-            file_size_mb = uploaded_file.size / (1024 * 1024)
-            estimated_time = max(1, int(file_size_mb / 10))  # Aproximativ 10MB/minut
-            st.info(f"⏱️ Timp estimat: {estimated_time}-{estimated_time*2} minute")
+        if video_source:
+            # Estimare timp
+            source_type = video_source[0]
+            est_times = {
+                'upload': "1-3 minute",
+                'youtube': "2-5 minute",
+                'gdrive': "2-5 minute",
+                'direct': "2-5 minute"
+            }
+            st.info(f"⏱️ Estimare: {est_times.get(source_type, '2-5 minute')}")
     
-    if uploaded_file:
-        # Re-validează înainte de procesare
-        is_valid, file_size_mb = validate_file_size(uploaded_file)
-        
-        if is_valid and st.button("🚀 Începe Transcrierea", use_container_width=True, type="primary", key="start_transcribe"):
-            # Obține cheile API
+    # Buton transcriere
+    if video_source:
+        if st.button("🚀 Începe Transcrierea", use_container_width=True, type="primary"):
             keys = get_api_keys_from_secrets()
             
-            # Adaugă cheile temporare dacă există
             if 'temp_api_keys' in st.session_state:
                 keys = st.session_state.temp_api_keys + keys
             
             if not keys:
-                st.error("❌ Nu există chei API disponibile!")
+                st.error("❌ Nu există chei API!")
                 return
             
-            # Găsește o cheie funcțională
-            working_key, key_index, msg = get_working_api_key(keys)
+            working_key, _, msg = get_working_api_key(keys)
             
             if not working_key:
                 st.error(f"❌ {msg}")
                 return
             
-            # Progress
             progress_bar = st.progress(0)
             status_text = st.empty()
             
             def update_progress(value, text):
-                progress_bar.progress(value)
+                progress_bar.progress(min(value, 1.0))
                 status_text.text(text)
             
             try:
-                # 1. Salvează video temporar
-                update_progress(0.1, "📁 Salvare fișier...")
+                source_type, source_data, file_size_mb = video_source
                 
-                with tempfile.NamedTemporaryFile(delete=False, suffix=f".{uploaded_file.name.split('.')[-1]}") as tmp:
-                    tmp.write(uploaded_file.getbuffer())
-                    tmp_path = tmp.name
+                # Procesare în funcție de tip
+                if source_type == 'upload':
+                    # Upload direct
+                    update_progress(0.1, "📁 Salvare fișier...")
+                    
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{source_data.name.split('.')[-1]}") as tmp:
+                        tmp.write(source_data.getbuffer())
+                        file_path = tmp.name
+                    
+                    video_name = source_data.name
+                    source_url = ""
+                    
+                elif source_type == 'youtube':
+                    # Descarcă de pe YouTube
+                    file_path, video_name, download_type = download_youtube_video(
+                        source_data, 
+                        max_size_mb=GEMINI_DIRECT_UPLOAD_LIMIT_MB,
+                        progress_callback=update_progress
+                    )
+                    
+                    if not file_path:
+                        st.error(f"❌ Nu s-a putut descărca: {download_type}")
+                        return
+                    
+                    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+                    source_url = f"https://youtube.com/watch?v={source_data}"
+                    
+                    # Flag pentru audio-only
+                    is_audio_only = (download_type == 'audio_only')
                 
-                # 2. Upload pe Google
-                video_file, error = upload_video_to_gemini(tmp_path, update_progress)
+                elif source_type == 'gdrive':
+                    # Descarcă de pe Google Drive
+                    file_path, video_name, error = download_gdrive_video(
+                        source_data,
+                        progress_callback=update_progress
+                    )
+                    
+                    if not file_path:
+                        st.error(f"❌ Nu s-a putut descărca: {error}")
+                        return
+                    
+                    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+                    source_url = f"https://drive.google.com/file/d/{source_data}"
                 
-                if error:
-                    st.error(error)
-                    os.unlink(tmp_path)
+                elif source_type == 'direct':
+                    # Descarcă de la URL direct
+                    file_path, video_name, error = download_direct_video(
+                        source_data,
+                        progress_callback=update_progress
+                    )
+                    
+                    if not file_path:
+                        st.error(f"❌ Nu s-a putut descărca: {error}")
+                        return
+                    
+                    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+                    source_url = source_data
+                
+                # Verifică dimensiunea
+                if file_size_mb > GEMINI_DIRECT_UPLOAD_LIMIT_MB:
+                    st.error(f"❌ Fișier prea mare după descărcare: {file_size_mb:.1f}MB")
+                    os.unlink(file_path)
                     return
                 
-                # 3. Transcrie
-                transcription, error = transcribe_video(
-                    video_file, source_lang, target_lang, 
-                    working_key, update_progress
+                # Procesare și transcriere
+                is_audio = source_type == 'youtube' and 'is_audio_only' in locals() and is_audio_only
+                
+                transcription, error = process_and_transcribe(
+                    file_path, 
+                    source_lang, 
+                    target_lang,
+                    working_key,
+                    file_size_mb,
+                    update_progress,
+                    is_audio_only=is_audio
                 )
+                
+                # Cleanup
+                try:
+                    os.unlink(file_path)
+                except:
+                    pass
                 
                 if error:
                     st.error(error)
-                    # Încearcă cu altă cheie dacă aceasta a eșuat
-                    if "quota" in error.lower() and key_index < len(keys) - 1:
-                        st.warning("⚠️ Încerc cu altă cheie API...")
-                        for next_key in keys[key_index + 1:]:
-                            valid, _ = test_api_key(next_key)
-                            if valid:
-                                transcription, error = transcribe_video(
-                                    video_file, source_lang, target_lang,
-                                    next_key, update_progress
-                                )
-                                if not error:
-                                    break
-                    
-                    if error:
-                        cleanup_video_file(video_file)
-                        os.unlink(tmp_path)
-                        return
+                    return
                 
-                # 4. Cleanup
-                cleanup_video_file(video_file)
-                os.unlink(tmp_path)
+                if not transcription:
+                    st.error("❌ Nu s-a putut genera transcrierea")
+                    return
                 
-                # 5. Salvează în DB
+                # Salvează în DB
                 save_transcription(
                     st.session_state.session_id,
-                    uploaded_file.name,
+                    video_name,
                     source_lang,
                     target_lang,
-                    transcription
+                    transcription,
+                    file_size_mb,
+                    source_type,
+                    source_url,
+                    source_type
                 )
                 
-                # Log succes
-                log_api_key_usage(key_index, "success", None)
-                
                 update_progress(1.0, "✅ Transcriere completă!")
-                st.success("🎉 Video transcris cu succes!")
+                st.success(f"🎉 Video transcris cu succes!")
                 
                 # Afișează rezultatul
                 st.markdown("### 📝 Transcriere")
@@ -953,65 +1294,77 @@ def render_upload_tab():
                 
                 with col1:
                     word_doc = create_word_document(
-                        transcription, uploaded_file.name,
-                        source_lang, target_lang
+                        transcription, 
+                        video_name,
+                        source_lang, 
+                        target_lang,
+                        file_size_mb,
+                        source_type,
+                        source_url
                     )
                     if word_doc:
                         st.download_button(
-                            "📥 Descarcă Word (.docx)",
+                            "📥 Descarcă Word",
                             word_doc,
-                            f"transcriere_{uploaded_file.name.split('.')[0]}.docx",
-                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                            key="download_word"
+                            f"transcriere_{video_name.split('.')[0]}.docx",
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                         )
                 
                 with col2:
                     st.download_button(
-                        "📥 Descarcă Text (.txt)",
+                        "📥 Descarcă Text",
                         transcription,
-                        f"transcriere_{uploaded_file.name.split('.')[0]}.txt",
-                        mime="text/plain",
-                        key="download_txt"
+                        f"transcriere_{video_name.split('.')[0]}.txt",
+                        mime="text/plain"
                     )
                 
-                # Salvează în mesaje pentru chat
-                save_message(
-                    st.session_state.session_id,
-                    "assistant",
-                    f"✅ Am transcris video-ul '{uploaded_file.name}' ({file_size_mb:.1f}MB) din {source_lang} în {target_lang}"
-                )
-                
             except Exception as e:
-                st.error(f"❌ Eroare neașteptată: {e}")
+                st.error(f"❌ Eroare: {str(e)}")
 
 def render_history_tab():
-    """Tab cu istoricul transcrierilor"""
     st.markdown("### 📜 Istoric Transcrieri")
     
     transcriptions = get_transcriptions(st.session_state.session_id)
     
     if not transcriptions:
-        st.info("📭 Nu există transcrieri încă. Încarcă un video pentru a începe!")
+        st.info("📭 Nu există transcrieri încă")
     else:
         for i, trans in enumerate(transcriptions):
-            with st.expander(
-                f"🎬 {trans['video_name']} - {trans['created_at']}",
-                expanded=False
-            ):
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.write(f"**Limba sursă:** {trans.get('source_language', 'Auto-detect')}")
-                with col2:
-                    st.write(f"**Limba țintă:** {trans.get('target_language', 'Română')}")
-                with col3:
+            # Icon pentru tip sursă
+            source_icon = {
+                'upload': '📤',
+                'youtube': '🎬',
+                'gdrive': '☁️',
+                'direct': '🔗'
+            }.get(trans.get('source_type', 'upload'), '📎')
+            
+            title = f"{source_icon} {trans['video_name']}"
+            if trans.get('file_size_mb', 0) > 0:
+                title += f" ({trans['file_size_mb']:.1f}MB)"
+            title += f" - {trans['created_at']}"
+            
+            with st.expander(title, expanded=False):
+                # Info
+                cols = st.columns(4)
+                with cols[0]:
+                    st.write(f"**Sursă:** {trans.get('source_language', 'N/A')}")
+                with cols[1]:
+                    st.write(f"**Țintă:** {trans.get('target_language', 'N/A')}")
+                with cols[2]:
+                    st.write(f"**Tip:** {trans.get('source_type', 'upload')}")
+                with cols[3]:
                     st.write(f"**Status:** {trans.get('status', 'completed')}")
                 
-                st.markdown("**Transcriere:**")
+                # URL sursă dacă există
+                if trans.get('source_url'):
+                    st.caption(f"🔗 {trans['source_url'][:100]}...")
+                
+                # Transcriere
                 st.text_area(
-                    "text",
+                    "Transcriere",
                     trans['transcription'],
                     height=300,
-                    key=f"trans_{trans['id']}_{i}",
+                    key=f"hist_{trans['id']}",
                     label_visibility="collapsed"
                 )
                 
@@ -1021,50 +1374,46 @@ def render_history_tab():
                     word_doc = create_word_document(
                         trans['transcription'],
                         trans['video_name'],
-                        trans.get('source_language', 'Auto-detect'),
-                        trans.get('target_language', 'Română')
+                        trans.get('source_language', ''),
+                        trans.get('target_language', ''),
+                        trans.get('file_size_mb', 0),
+                        trans.get('source_type', ''),
+                        trans.get('source_url', '')
                     )
                     if word_doc:
                         st.download_button(
                             "📥 Word",
                             word_doc,
-                            f"transcriere_{trans['id']}.docx",
+                            f"trans_{trans['id']}.docx",
                             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                            key=f"word_{trans['id']}_{i}"
+                            key=f"w_{trans['id']}"
                         )
                 
                 with col2:
                     st.download_button(
                         "📥 Text",
                         trans['transcription'],
-                        f"transcriere_{trans['id']}.txt",
+                        f"trans_{trans['id']}.txt",
                         mime="text/plain",
-                        key=f"txt_{trans['id']}_{i}"
+                        key=f"t_{trans['id']}"
                     )
 
 def render_chat_tab():
-    """Tab pentru chat cu AI"""
-    st.markdown("### 💬 Conversație cu AI")
-    st.caption("Întreabă despre transcrieri sau cere ajutor")
+    st.markdown("### 💬 Chat cu AI despre Transcrieri")
     
-    # Afișează mesajele
     messages = get_messages(st.session_state.session_id)
     
     for msg in messages:
         with st.chat_message(msg['role']):
             st.markdown(msg['content'])
     
-    # Input mesaj nou
-    if prompt := st.chat_input("Scrie un mesaj...", key="chat_input"):
-        # Salvează și afișează mesajul utilizatorului
+    if prompt := st.chat_input("Întreabă despre transcrieri..."):
         with st.chat_message("user"):
             st.markdown(prompt)
         save_message(st.session_state.session_id, "user", prompt)
         
-        # Generează răspuns
         with st.chat_message("assistant"):
             with st.spinner("Generez răspuns..."):
-                # Obține cheile
                 keys = get_api_keys_from_secrets()
                 if 'temp_api_keys' in st.session_state:
                     keys = st.session_state.temp_api_keys + keys
@@ -1073,32 +1422,31 @@ def render_chat_tab():
                     st.error("❌ Nu există chei API!")
                     return
                 
-                # Găsește cheie funcțională
                 working_key, _, _ = get_working_api_key(keys)
                 if not working_key:
-                    st.error("❌ Toate cheile API sunt invalide!")
+                    st.error("❌ Toate cheile sunt invalide!")
                     return
                 
                 try:
                     genai.configure(api_key=working_key)
                     model = genai.GenerativeModel('gemini-1.5-flash')
                     
-                    # Context cu transcrieri recente
-                    recent_trans = get_transcriptions(st.session_state.session_id)[:3]
+                    # Context
+                    recent = get_transcriptions(st.session_state.session_id)[:2]
                     context = ""
-                    if recent_trans:
-                        context = "Context - Transcrieri recente:\n"
-                        for t in recent_trans:
-                            context += f"- {t['video_name']}: {t['transcription'][:200]}...\n"
+                    if recent:
+                        context = "Transcrieri recente:\n"
+                        for t in recent:
+                            source_type = t.get('source_type', 'upload')
+                            context += f"- {t['video_name']} ({source_type}): {t['transcription'][:300]}...\n\n"
                     
-                    # Generează răspuns
                     full_prompt = f"""
-                    {context}
-                    
-                    Utilizator: {prompt}
-                    
-                    Răspunde în română, util și concis. Dacă întrebarea e despre transcrieri, folosește contextul.
-                    """
+{context}
+
+Utilizator: {prompt}
+
+Răspunde în română. Dacă întrebarea e despre transcrieri, folosește contextul de mai sus.
+"""
                     
                     response = model.generate_content(full_prompt)
                     response_text = response.text
@@ -1109,32 +1457,30 @@ def render_chat_tab():
                 except Exception as e:
                     st.error(f"❌ Eroare: {e}")
 
-# ==================== MAIN APP ====================
+# ==================== MAIN ====================
 
 def main():
-    # Inițializare
     init_database()
     init_session()
     
-    # Sidebar
     render_sidebar()
     
-    # Header
     st.markdown("""
     <div class="main-header">
         <h1>🎬 AI Video Transcriber</h1>
-        <p>Transcrie orice video în orice limbă folosind Google Gemini AI</p>
-        <p style="font-size: 0.9rem; opacity: 0.8;">Limită fișier: {MAX_FILE_SIZE_MB}MB | Formate: MP4, AVI, MOV, MKV și altele</p>
+        <p>Transcrie videouri din YouTube, Google Drive, link-uri directe sau upload</p>
+        <p style="font-size: 0.9rem; opacity: 0.8;">
+            Powered by Google Gemini AI | Suport multilingv | Export Word/Text
+        </p>
     </div>
     """, unsafe_allow_html=True)
     
-    # Verificare sistem
     if not GEMINI_AVAILABLE:
-        st.error("❌ Google Generative AI nu este instalat corect!")
+        st.error("❌ Google Generative AI nu este instalat!")
         st.stop()
     
-    # Tabs
-    tab1, tab2, tab3 = st.tabs(["📤 Încarcă Video", "📜 Istoric", "💬 Chat AI"])
+    # Tabs principale
+    tab1, tab2, tab3 = st.tabs(["🚀 Transcriere", "📜 Istoric", "💬 Chat AI"])
     
     with tab1:
         render_upload_tab()
