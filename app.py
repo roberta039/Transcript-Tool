@@ -237,8 +237,8 @@ def get_api_keys_from_secrets():
     
     try:
         # Verifică pentru chei multiple
-        if "GEMINI_API_KEYS" in st.secrets:
-            secret_keys = st.secrets["GEMINI_API_KEYS"]
+        if "GOOGLE_API_KEYS" in st.secrets:
+            secret_keys = st.secrets["GOOGLE_API_KEYS"]
             if isinstance(secret_keys, list):
                 keys.extend(secret_keys)
             elif isinstance(secret_keys, str):
@@ -540,7 +540,7 @@ def render_sidebar():
             1. Settings → Secrets
             2. Adaugă:
             ```
-            GEMINI_API_KEYS = ["key1", "key2", "key3"]
+            GOOGLE_API_KEYS = ["key1", "key2", "key3"]
             # sau
             GEMINI_API_KEY = "your-api-key"
             ```
