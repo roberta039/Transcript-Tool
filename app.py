@@ -7,24 +7,18 @@ import tempfile
 import os
 import time
 from io import BytesIO
+import json
 
 # Încearcă să importe biblioteca Gemini
 GEMINI_AVAILABLE = False
 GEMINI_VERSION = None
 
 try:
-    from google import genai
+    import google.generativeai as genai
     GEMINI_AVAILABLE = True
-    GEMINI_VERSION = "new"
-    st.success("✅ Folosim google-genai (versiunea nouă)")
+    GEMINI_VERSION = "old"
 except ImportError:
-    try:
-        import google.generativeai as genai
-        GEMINI_AVAILABLE = True
-        GEMINI_VERSION = "old"
-        st.warning("⚠️ Folosim google-generativeai (versiunea veche)")
-    except ImportError:
-        st.error("❌ Nu s-a putut importa nicio versiune de Gemini API")
+    st.error("❌ google-generativeai nu este instalat")
 
 # Import python-docx
 try:
@@ -50,17 +44,56 @@ st.markdown("""
 <style>
     .main-header {
         text-align: center;
-        padding: 1rem;
-        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+        padding: 2rem;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         color: white;
-        border-radius: 10px;
+        border-radius: 15px;
         margin-bottom: 2rem;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.2);
     }
-    .info-box {
-        background-color: #f0f2f6;
+    .main-header h1 {
+        margin: 0;
+        font-size: 2.5rem;
+    }
+    .main-header p {
+        margin: 0.5rem 0 0 0;
+        opacity: 0.95;
+    }
+    .session-info {
+        background-color: #e7f3ff;
         padding: 1rem;
         border-radius: 8px;
-        margin: 1rem 0;
+        border-left: 4px solid #0066cc;
+        margin-bottom: 1rem;
+    }
+    .api-key-status {
+        padding: 0.5rem;
+        border-radius: 5px;
+        margin: 0.5rem 0;
+    }
+    .api-active {
+        background-color: #d4edda;
+        color: #155724;
+    }
+    .api-expired {
+        background-color: #f8d7da;
+        color: #721c24;
+    }
+    .transcription-box {
+        background-color: #f8f9fa;
+        padding: 1.5rem;
+        border-radius: 10px;
+        border: 1px solid #dee2e6;
+        max-height: 500px;
+        overflow-y: auto;
+        font-family: 'Courier New', monospace;
+    }
+    .stButton > button {
+        transition: all 0.3s;
+    }
+    .stButton > button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 5px 15px rgba(0,0,0,0.2);
     }
 </style>
 """, unsafe_allow_html=True)
@@ -91,196 +124,385 @@ def init_database():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT,
             video_name TEXT,
+            source_language TEXT,
+            target_language TEXT,
             transcription TEXT,
+            status TEXT DEFAULT 'completed',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (session_id) REFERENCES sessions(session_id)
         )
     ''')
     
-    # Tabel pentru API keys
+    # Tabel pentru mesaje conversație
     cursor.execute('''
-        CREATE TABLE IF NOT EXISTS api_keys (
+        CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            api_key TEXT UNIQUE,
-            status TEXT DEFAULT 'active',
-            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            session_id TEXT,
+            role TEXT,
+            content TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+        )
+    ''')
+    
+    # Tabel pentru tracking chei API
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS api_key_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            key_index INTEGER,
+            status TEXT,
+            error_message TEXT,
+            used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     
     conn.commit()
     conn.close()
 
-# ==================== FUNCȚII HELPER ====================
+# ==================== SESSION MANAGEMENT ====================
 
 def generate_session_id():
     return str(uuid.uuid4())[:8]
 
-def get_or_create_session():
-    """Obține sau creează o sesiune"""
-    if 'session_id' not in st.session_state:
-        st.session_state.session_id = generate_session_id()
-        
-        conn = sqlite3.connect(str(DB_FILE))
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT OR IGNORE INTO sessions (session_id) VALUES (?)",
-            (st.session_state.session_id,)
-        )
-        conn.commit()
-        conn.close()
-    
-    return st.session_state.session_id
+def get_session_id_from_url():
+    """Obține session ID din query params"""
+    return st.query_params.get("session", None)
 
-def save_api_key(api_key):
-    """Salvează o cheie API"""
+def set_session_id_in_url(session_id):
+    """Setează session ID în URL"""
+    st.query_params["session"] = session_id
+
+def init_session():
+    """Inițializează sau restaurează sesiunea"""
+    url_session_id = get_session_id_from_url()
+    
+    if url_session_id and session_exists(url_session_id):
+        # Restaurează sesiunea existentă
+        st.session_state.session_id = url_session_id
+        
+        # Încarcă datele din DB dacă nu sunt deja încărcate
+        if 'session_loaded' not in st.session_state:
+            st.session_state.messages = get_messages(url_session_id)
+            st.session_state.transcriptions = get_transcriptions(url_session_id)
+            st.session_state.session_loaded = True
+    else:
+        # Creează sesiune nouă
+        if 'session_id' not in st.session_state:
+            new_session_id = generate_session_id()
+            st.session_state.session_id = new_session_id
+            create_session(new_session_id)
+            set_session_id_in_url(new_session_id)
+            st.session_state.messages = []
+            st.session_state.transcriptions = []
+            st.session_state.session_loaded = True
+    
+    # Inițializează alte variabile
+    if 'current_api_key_index' not in st.session_state:
+        st.session_state.current_api_key_index = 0
+
+def session_exists(session_id):
+    """Verifică dacă sesiunea există în DB"""
     conn = sqlite3.connect(str(DB_FILE))
     cursor = conn.cursor()
-    try:
-        cursor.execute(
-            "INSERT OR IGNORE INTO api_keys (api_key) VALUES (?)",
-            (api_key,)
-        )
-        conn.commit()
-        return True
-    except:
-        return False
-    finally:
-        conn.close()
+    cursor.execute("SELECT 1 FROM sessions WHERE session_id = ?", (session_id,))
+    exists = cursor.fetchone() is not None
+    conn.close()
+    return exists
 
-def get_active_api_keys():
-    """Obține cheile API active"""
+def create_session(session_id):
+    """Creează o sesiune nouă în DB"""
     conn = sqlite3.connect(str(DB_FILE))
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT api_key FROM api_keys WHERE status = 'active'"
+        "INSERT OR IGNORE INTO sessions (session_id) VALUES (?)",
+        (session_id,)
     )
-    keys = [row[0] for row in cursor.fetchall()]
+    conn.commit()
     conn.close()
+
+def delete_session_data(session_id):
+    """Șterge toate datele unei sesiuni"""
+    conn = sqlite3.connect(str(DB_FILE))
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+    cursor.execute("DELETE FROM transcriptions WHERE session_id = ?", (session_id,))
+    conn.commit()
+    conn.close()
+
+# ==================== API KEY MANAGEMENT ====================
+
+def get_api_keys_from_secrets():
+    """Obține cheile API din Streamlit secrets"""
+    keys = []
+    
+    try:
+        # Verifică pentru chei multiple
+        if "GEMINI_API_KEYS" in st.secrets:
+            secret_keys = st.secrets["GEMINI_API_KEYS"]
+            if isinstance(secret_keys, list):
+                keys.extend(secret_keys)
+            elif isinstance(secret_keys, str):
+                # Dacă e string cu mai multe chei separate prin virgulă
+                keys.extend([k.strip() for k in secret_keys.split(",") if k.strip()])
+        
+        # Verifică pentru cheie singulară
+        if "GEMINI_API_KEY" in st.secrets:
+            single_key = st.secrets["GEMINI_API_KEY"]
+            if single_key and single_key not in keys:
+                keys.append(single_key)
+                
+    except Exception as e:
+        st.error(f"Eroare la citirea cheilor din secrets: {e}")
+    
     return keys
 
-def save_transcription(session_id, video_name, transcription):
+def test_api_key(api_key):
+    """Testează dacă o cheie API funcționează"""
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        response = model.generate_content('Say "OK"')
+        return True, "✅ Cheie validă"
+    except Exception as e:
+        error_msg = str(e)
+        if "quota" in error_msg.lower() or "billing" in error_msg.lower():
+            return False, "❌ Cheie expirată (quota/billing)"
+        elif "api key" in error_msg.lower():
+            return False, "❌ Cheie invalidă"
+        else:
+            return False, f"❌ Eroare: {error_msg[:100]}"
+
+def get_working_api_key(keys):
+    """Găsește prima cheie funcțională din listă"""
+    if not keys:
+        return None, None, "Nu există chei API configurate"
+    
+    for i, key in enumerate(keys):
+        valid, msg = test_api_key(key)
+        if valid:
+            return key, i, msg
+        
+        # Log folosirea cheii
+        log_api_key_usage(i, "failed", msg)
+    
+    return None, None, "Toate cheile API sunt expirate sau invalide"
+
+def log_api_key_usage(key_index, status, error_msg=None):
+    """Loghează folosirea unei chei API"""
+    conn = sqlite3.connect(str(DB_FILE))
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO api_key_usage (key_index, status, error_message) VALUES (?, ?, ?)",
+        (key_index, status, error_msg)
+    )
+    conn.commit()
+    conn.close()
+
+# ==================== DATABASE OPERATIONS ====================
+
+def save_message(session_id, role, content):
+    """Salvează un mesaj în conversație"""
+    conn = sqlite3.connect(str(DB_FILE))
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+        (session_id, role, content)
+    )
+    conn.commit()
+    conn.close()
+
+def get_messages(session_id):
+    """Obține mesajele unei sesiuni"""
+    conn = sqlite3.connect(str(DB_FILE))
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT role, content, created_at FROM messages WHERE session_id = ? ORDER BY created_at",
+        (session_id,)
+    )
+    messages = [{"role": row[0], "content": row[1], "time": row[2]} for row in cursor.fetchall()]
+    conn.close()
+    return messages
+
+def save_transcription(session_id, video_name, source_lang, target_lang, transcription):
     """Salvează o transcriere"""
     conn = sqlite3.connect(str(DB_FILE))
     cursor = conn.cursor()
     cursor.execute(
         '''INSERT INTO transcriptions 
-           (session_id, video_name, transcription) 
-           VALUES (?, ?, ?)''',
-        (session_id, video_name, transcription)
+           (session_id, video_name, source_language, target_language, transcription) 
+           VALUES (?, ?, ?, ?, ?)''',
+        (session_id, video_name, source_lang, target_lang, transcription)
     )
     conn.commit()
+    transcription_id = cursor.lastrowid
     conn.close()
+    return transcription_id
 
 def get_transcriptions(session_id):
-    """Obține transcrierile pentru o sesiune"""
+    """Obține transcrierile unei sesiuni"""
     conn = sqlite3.connect(str(DB_FILE))
     cursor = conn.cursor()
     cursor.execute(
-        '''SELECT video_name, transcription, created_at 
+        '''SELECT id, video_name, source_language, target_language, 
+           transcription, status, created_at 
            FROM transcriptions 
            WHERE session_id = ? 
            ORDER BY created_at DESC''',
         (session_id,)
     )
-    results = cursor.fetchall()
+    
+    transcriptions = []
+    for row in cursor.fetchall():
+        transcriptions.append({
+            "id": row[0],
+            "video_name": row[1],
+            "source_language": row[2],
+            "target_language": row[3],
+            "transcription": row[4],
+            "status": row[5],
+            "created_at": row[6]
+        })
     conn.close()
-    return results
+    return transcriptions
 
-# ==================== GEMINI API ====================
+# ==================== VIDEO PROCESSING ====================
 
-def test_api_key(api_key):
-    """Testează dacă o cheie API funcționează"""
-    if not GEMINI_AVAILABLE:
-        return False, "Gemini API nu este disponibil"
-    
+SUPPORTED_FORMATS = ['mp4', 'mpeg', 'mov', 'avi', 'mkv', 'webm', 'flv', 'wmv']
+
+LANGUAGES = {
+    "Română": "Romanian",
+    "Engleză": "English",
+    "Spaniolă": "Spanish",
+    "Franceză": "French",
+    "Germană": "German",
+    "Italiană": "Italian",
+    "Portugheză": "Portuguese",
+    "Rusă": "Russian",
+    "Chineză": "Chinese",
+    "Japoneză": "Japanese",
+    "Coreeană": "Korean",
+    "Arabă": "Arabic",
+    "Hindusă": "Hindi",
+    "Turcă": "Turkish",
+    "Auto-detect": "auto"
+}
+
+def upload_video_to_gemini(video_path, progress_callback=None):
+    """Încarcă video pe serverele Google"""
     try:
-        if GEMINI_VERSION == "new":
-            client = genai.Client(api_key=api_key)
-            response = client.models.generate_content(
-                model='gemini-2.0-flash-exp',
-                contents='Say "OK"'
-            )
-        else:
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel('gemini-1.5-flash')
-            response = model.generate_content('Say "OK"')
+        if progress_callback:
+            progress_callback(0.3, "📤 Încărcare video pe serverele Google...")
         
-        return True, "Cheie validă"
-    except Exception as e:
-        return False, str(e)
-
-def transcribe_with_gemini(video_path, api_key):
-    """Transcrie un video folosind Gemini"""
-    if not GEMINI_AVAILABLE:
-        return None, "Gemini API nu este disponibil"
-    
-    try:
-        if GEMINI_VERSION == "new":
-            client = genai.Client(api_key=api_key)
-            
-            # Upload video
-            with open(video_path, 'rb') as f:
-                video_file = client.files.upload(file=f)
-            
-            # Așteaptă procesarea
+        # Upload fișier
+        video_file = genai.upload_file(path=video_path)
+        
+        if progress_callback:
+            progress_callback(0.5, "⏳ Procesare video...")
+        
+        # Așteaptă procesarea
+        while video_file.state.name == "PROCESSING":
             time.sleep(2)
-            
-            # Transcrie
-            response = client.models.generate_content(
-                model='gemini-2.0-flash-exp',
-                contents=[
-                    video_file,
-                    "Transcrie complet acest video în română. Include timestamps."
-                ]
-            )
-            
-            return response.text, None
-            
-        else:  # old version
-            genai.configure(api_key=api_key)
-            
-            # Upload video
-            video_file = genai.upload_file(path=video_path)
-            
-            # Așteaptă procesarea
-            while video_file.state.name == "PROCESSING":
-                time.sleep(2)
-                video_file = genai.get_file(video_file.name)
-            
-            if video_file.state.name == "FAILED":
-                return None, "Procesarea video a eșuat"
-            
-            # Transcrie
-            model = genai.GenerativeModel('gemini-1.5-pro')
-            response = model.generate_content(
-                [video_file, "Transcrie complet acest video în română. Include timestamps."]
-            )
-            
-            return response.text, None
-            
+            video_file = genai.get_file(video_file.name)
+        
+        if video_file.state.name == "FAILED":
+            return None, "❌ Procesarea video a eșuat"
+        
+        if progress_callback:
+            progress_callback(0.7, "✅ Video încărcat cu succes!")
+        
+        return video_file, None
+        
     except Exception as e:
-        return None, str(e)
+        return None, f"❌ Eroare upload: {str(e)}"
 
-def create_word_document(transcription, video_name):
-    """Creează un document Word"""
+def transcribe_video(video_file, source_lang, target_lang, api_key, progress_callback=None):
+    """Transcrie video folosind Gemini"""
+    try:
+        if progress_callback:
+            progress_callback(0.8, "🤖 Transcriere cu AI...")
+        
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-1.5-pro')
+        
+        # Construiește prompt
+        source = LANGUAGES.get(source_lang, "auto")
+        target = LANGUAGES.get(target_lang, "Romanian")
+        
+        prompt = f"""
+Analizează acest video și transcrie tot conținutul audio/vocal.
+
+INSTRUCȚIUNI:
+1. Limba sursă: {source} {'(detectează automat)' if source == 'auto' else ''}
+2. Limba țintă pentru transcriere: {target}
+3. Transcrie COMPLET tot ce se vorbește
+4. Include timestamps pentru fiecare segment
+5. {'TRADUCE în ' + target if source != target and source != 'auto' else 'Păstrează limba originală'}
+6. Formatează clar și profesional
+
+FORMAT:
+[MM:SS] - Text transcris
+[MM:SS] - Continuare text...
+
+Începe transcrierea:
+"""
+        
+        response = model.generate_content([video_file, prompt])
+        
+        if progress_callback:
+            progress_callback(1.0, "✅ Transcriere completă!")
+        
+        return response.text, None
+        
+    except Exception as e:
+        return None, f"❌ Eroare transcriere: {str(e)}"
+
+def cleanup_video_file(video_file):
+    """Șterge video de pe serverele Google"""
+    try:
+        genai.delete_file(video_file.name)
+    except:
+        pass
+
+# ==================== WORD EXPORT ====================
+
+def create_word_document(transcription, video_name, source_lang, target_lang):
+    """Creează document Word cu transcrierea"""
     if not DOCX_AVAILABLE:
         return None
     
     doc = Document()
     
     # Titlu
-    doc.add_heading('Transcriere Video', 0)
+    title = doc.add_heading('Transcriere Video', 0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
     
-    # Info
-    doc.add_paragraph(f'Video: {video_name}')
-    doc.add_paragraph(f'Data: {datetime.now().strftime("%d.%m.%Y %H:%M")}')
+    # Metadata
+    doc.add_paragraph()
+    info = doc.add_paragraph()
+    info.add_run('Informații Document\n').bold = True
+    info.add_run(f'📹 Video: {video_name}\n')
+    info.add_run(f'🌐 Limba sursă: {source_lang}\n')
+    info.add_run(f'🎯 Limba țintă: {target_lang}\n')
+    info.add_run(f'📅 Data: {datetime.now().strftime("%d.%m.%Y %H:%M")}\n')
     
     # Separator
-    doc.add_paragraph('─' * 50)
+    doc.add_paragraph('─' * 60)
     
     # Transcriere
-    doc.add_heading('Transcriere', level=1)
-    doc.add_paragraph(transcription)
+    doc.add_heading('Conținut Transcris', level=1)
+    
+    # Adaugă transcrierea formatată
+    for line in transcription.split('\n'):
+        if line.strip():
+            para = doc.add_paragraph(line)
+            para.paragraph_format.space_after = Pt(6)
+    
+    # Footer
+    doc.add_paragraph()
+    doc.add_paragraph('─' * 60)
+    footer = doc.add_paragraph()
+    footer.add_run('Generat cu AI Video Transcriber - Powered by Google Gemini').italic = True
+    footer.alignment = WD_ALIGN_PARAGRAPH.CENTER
     
     # Salvează în BytesIO
     doc_io = BytesIO()
@@ -289,232 +511,410 @@ def create_word_document(transcription, video_name):
     
     return doc_io
 
-# ==================== INTERFAȚĂ ====================
+# ==================== UI COMPONENTS ====================
 
 def render_sidebar():
-    """Bara laterală"""
+    """Sidebar cu configurări"""
     with st.sidebar:
         st.markdown("## ⚙️ Configurare")
         
-        # Info sesiune
-        session_id = get_or_create_session()
-        st.info(f"📋 Sesiune: {session_id}")
+        # Session info
+        st.markdown(f"""
+        <div class="session-info">
+            <strong>📋 ID Sesiune:</strong> {st.session_state.session_id}<br>
+            <strong>🔗 Link permanent:</strong><br>
+            <code>?session={st.session_state.session_id}</code><br>
+            <small>💡 Salvează acest link pentru a reveni la conversație</small>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # API Keys Status
+        st.markdown("### 🔑 Status Chei API")
+        
+        keys = get_api_keys_from_secrets()
+        
+        if not keys:
+            st.error("❌ Nu există chei API în Secrets!")
+            st.markdown("""
+            **Configurare în Streamlit Cloud:**
+            1. Settings → Secrets
+            2. Adaugă:
+            ```
+            GEMINI_API_KEYS = ["key1", "key2", "key3"]
+            # sau
+            GEMINI_API_KEY = "your-api-key"
+            ```
+            """)
+            
+            # Permite adăugare manuală temporară
+            st.markdown("---")
+            st.markdown("**SAU** adaugă temporar aici:")
+            temp_key = st.text_input("Cheie API temporară:", type="password")
+            if st.button("Testează și folosește"):
+                if temp_key:
+                    valid, msg = test_api_key(temp_key)
+                    if valid:
+                        if 'temp_api_keys' not in st.session_state:
+                            st.session_state.temp_api_keys = []
+                        st.session_state.temp_api_keys.append(temp_key)
+                        st.success("✅ Cheie adăugată temporar!")
+                        st.rerun()
+                    else:
+                        st.error(msg)
+        else:
+            # Afișează status chei
+            st.success(f"✅ {len(keys)} chei disponibile")
+            
+            # Test chei
+            if st.button("🔄 Testează toate cheile"):
+                with st.spinner("Testare..."):
+                    for i, key in enumerate(keys):
+                        valid, msg = test_api_key(key)
+                        if valid:
+                            st.success(f"Cheie {i+1}: {msg}")
+                        else:
+                            st.error(f"Cheie {i+1}: {msg}")
         
         st.markdown("---")
         
-        # API Keys
-        st.markdown("### 🔑 Chei API")
+        # Butoane control sesiune
+        col1, col2 = st.columns(2)
         
-        # Verifică cheile din secrets
-        if "GEMINI_API_KEY" in st.secrets:
-            save_api_key(st.secrets["GEMINI_API_KEY"])
-            st.success("✅ Cheie din secrets detectată")
+        with col1:
+            if st.button("🔄 Reset conversație", use_container_width=True):
+                delete_session_data(st.session_state.session_id)
+                st.session_state.messages = []
+                st.session_state.transcriptions = []
+                st.success("✅ Date resetate!")
+                st.rerun()
         
-        # Afișează cheile existente
-        keys = get_active_api_keys()
-        if keys:
-            st.success(f"✅ {len(keys)} chei disponibile")
-        else:
-            st.warning("⚠️ Nu există chei API")
+        with col2:
+            if st.button("🆕 Sesiune nouă", use_container_width=True):
+                new_id = generate_session_id()
+                create_session(new_id)
+                st.session_state.session_id = new_id
+                st.session_state.messages = []
+                st.session_state.transcriptions = []
+                set_session_id_in_url(new_id)
+                st.rerun()
+
+def render_upload_tab():
+    """Tab pentru upload video"""
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        st.markdown("### 📤 Încarcă Video")
         
-        # Adaugă cheie nouă
-        new_key = st.text_input(
-            "Adaugă cheie API",
-            type="password",
-            placeholder="AIza..."
+        uploaded_file = st.file_uploader(
+            "Selectează fișier video",
+            type=SUPPORTED_FORMATS,
+            help=f"Formate suportate: {', '.join(SUPPORTED_FORMATS)}"
         )
         
-        if st.button("➕ Adaugă Cheie"):
-            if new_key:
-                # Testează cheia
-                valid, msg = test_api_key(new_key)
-                if valid:
-                    if save_api_key(new_key):
-                        st.success("✅ Cheie adăugată!")
-                        st.rerun()
-                else:
-                    st.error(f"❌ Cheie invalidă: {msg}")
+        if uploaded_file:
+            st.video(uploaded_file)
+            st.info(f"📁 **{uploaded_file.name}** ({uploaded_file.size / 1024 / 1024:.2f} MB)")
+    
+    with col2:
+        st.markdown("### 🌐 Setări Limbă")
         
-        st.markdown("---")
+        source_lang = st.selectbox(
+            "Limba sursă (din video)",
+            options=list(LANGUAGES.keys()),
+            index=list(LANGUAGES.keys()).index("Auto-detect")
+        )
         
-        # Reset
-        if st.button("🔄 Reset Sesiune"):
-            for key in list(st.session_state.keys()):
-                del st.session_state[key]
-            st.rerun()
+        target_lang = st.selectbox(
+            "Limba țintă (transcriere)",
+            options=[k for k in LANGUAGES.keys() if k != "Auto-detect"],
+            index=0  # Română
+        )
+    
+    if uploaded_file:
+        if st.button("🚀 Începe Transcrierea", use_container_width=True, type="primary"):
+            # Obține cheile API
+            keys = get_api_keys_from_secrets()
+            
+            # Adaugă cheile temporare dacă există
+            if 'temp_api_keys' in st.session_state:
+                keys = st.session_state.temp_api_keys + keys
+            
+            if not keys:
+                st.error("❌ Nu există chei API disponibile!")
+                return
+            
+            # Găsește o cheie funcțională
+            working_key, key_index, msg = get_working_api_key(keys)
+            
+            if not working_key:
+                st.error(f"❌ {msg}")
+                return
+            
+            # Progress
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            def update_progress(value, text):
+                progress_bar.progress(value)
+                status_text.text(text)
+            
+            try:
+                # 1. Salvează video temporar
+                update_progress(0.1, "📁 Salvare fișier...")
+                
+                with tempfile.NamedTemporaryFile(delete=False, suffix=f".{uploaded_file.name.split('.')[-1]}") as tmp:
+                    tmp.write(uploaded_file.getbuffer())
+                    tmp_path = tmp.name
+                
+                # 2. Upload pe Google
+                video_file, error = upload_video_to_gemini(tmp_path, update_progress)
+                
+                if error:
+                    st.error(error)
+                    os.unlink(tmp_path)
+                    return
+                
+                # 3. Transcrie
+                transcription, error = transcribe_video(
+                    video_file, source_lang, target_lang, 
+                    working_key, update_progress
+                )
+                
+                if error:
+                    st.error(error)
+                    # Încearcă cu altă cheie dacă aceasta a eșuat
+                    if key_index < len(keys) - 1:
+                        st.warning("⚠️ Încerc cu altă cheie API...")
+                        for next_key in keys[key_index + 1:]:
+                            valid, _ = test_api_key(next_key)
+                            if valid:
+                                transcription, error = transcribe_video(
+                                    video_file, source_lang, target_lang,
+                                    next_key, update_progress
+                                )
+                                if not error:
+                                    break
+                    
+                    if error:
+                        cleanup_video_file(video_file)
+                        os.unlink(tmp_path)
+                        return
+                
+                # 4. Cleanup
+                cleanup_video_file(video_file)
+                os.unlink(tmp_path)
+                
+                # 5. Salvează în DB
+                save_transcription(
+                    st.session_state.session_id,
+                    uploaded_file.name,
+                    source_lang,
+                    target_lang,
+                    transcription
+                )
+                
+                # Log succes
+                log_api_key_usage(key_index, "success", None)
+                
+                update_progress(1.0, "✅ Transcriere completă!")
+                st.success("🎉 Video transcris cu succes!")
+                
+                # Afișează rezultatul
+                st.markdown("### 📝 Transcriere")
+                st.markdown(f"""
+                <div class="transcription-box">
+                {transcription}
+                </div>
+                """, unsafe_allow_html=True)
+                
+                # Butoane descărcare
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    word_doc = create_word_document(
+                        transcription, uploaded_file.name,
+                        source_lang, target_lang
+                    )
+                    if word_doc:
+                        st.download_button(
+                            "📥 Descarcă Word (.docx)",
+                            word_doc,
+                            f"transcriere_{uploaded_file.name.split('.')[0]}.docx",
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                        )
+                
+                with col2:
+                    st.download_button(
+                        "📥 Descarcă Text (.txt)",
+                        transcription,
+                        f"transcriere_{uploaded_file.name.split('.')[0]}.txt",
+                        mime="text/plain"
+                    )
+                
+                # Salvează în mesaje pentru chat
+                save_message(
+                    st.session_state.session_id,
+                    "assistant",
+                    f"✅ Am transcris video-ul '{uploaded_file.name}' din {source_lang} în {target_lang}"
+                )
+                
+            except Exception as e:
+                st.error(f"❌ Eroare neașteptată: {e}")
 
-def render_main():
-    """Conținut principal"""
+def render_history_tab():
+    """Tab cu istoricul transcrierilor"""
+    st.markdown("### 📜 Istoric Transcrieri")
+    
+    transcriptions = get_transcriptions(st.session_state.session_id)
+    
+    if not transcriptions:
+        st.info("📭 Nu există transcrieri încă. Încarcă un video pentru a începe!")
+    else:
+        for trans in transcriptions:
+            with st.expander(
+                f"🎬 {trans['video_name']} - {trans['created_at']}",
+                expanded=False
+            ):
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.write(f"**Limba sursă:** {trans['source_language']}")
+                with col2:
+                    st.write(f"**Limba țintă:** {trans['target_language']}")
+                with col3:
+                    st.write(f"**Status:** {trans['status']}")
+                
+                st.markdown("**Transcriere:**")
+                st.text_area(
+                    "text",
+                    trans['transcription'],
+                    height=300,
+                    key=f"trans_{trans['id']}",
+                    label_visibility="collapsed"
+                )
+                
+                # Descărcări
+                col1, col2 = st.columns(2)
+                with col1:
+                    word_doc = create_word_document(
+                        trans['transcription'],
+                        trans['video_name'],
+                        trans['source_language'],
+                        trans['target_language']
+                    )
+                    if word_doc:
+                        st.download_button(
+                            "📥 Word",
+                            word_doc,
+                            f"transcriere_{trans['id']}.docx",
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            key=f"word_{trans['id']}"
+                        )
+                
+                with col2:
+                    st.download_button(
+                        "📥 Text",
+                        trans['transcription'],
+                        f"transcriere_{trans['id']}.txt",
+                        mime="text/plain",
+                        key=f"txt_{trans['id']}"
+                    )
+
+def render_chat_tab():
+    """Tab pentru chat cu AI"""
+    st.markdown("### 💬 Conversație cu AI")
+    st.caption("Întreabă despre transcrieri sau cere ajutor")
+    
+    # Afișează mesajele
+    messages = get_messages(st.session_state.session_id)
+    
+    for msg in messages:
+        with st.chat_message(msg['role']):
+            st.markdown(msg['content'])
+    
+    # Input mesaj nou
+    if prompt := st.chat_input("Scrie un mesaj..."):
+        # Salvează și afișează mesajul utilizatorului
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        save_message(st.session_state.session_id, "user", prompt)
+        
+        # Generează răspuns
+        with st.chat_message("assistant"):
+            with st.spinner("Generez răspuns..."):
+                # Obține cheile
+                keys = get_api_keys_from_secrets()
+                if 'temp_api_keys' in st.session_state:
+                    keys = st.session_state.temp_api_keys + keys
+                
+                if not keys:
+                    st.error("❌ Nu există chei API!")
+                    return
+                
+                # Găsește cheie funcțională
+                working_key, _, _ = get_working_api_key(keys)
+                if not working_key:
+                    st.error("❌ Toate cheile API sunt invalide!")
+                    return
+                
+                try:
+                    genai.configure(api_key=working_key)
+                    model = genai.GenerativeModel('gemini-1.5-flash')
+                    
+                    # Context cu transcrieri recente
+                    recent_trans = get_transcriptions(st.session_state.session_id)[:3]
+                    context = ""
+                    if recent_trans:
+                        context = "Context - Transcrieri recente:\n"
+                        for t in recent_trans:
+                            context += f"- {t['video_name']}: {t['transcription'][:200]}...\n"
+                    
+                    # Generează răspuns
+                    full_prompt = f"""
+                    {context}
+                    
+                    Utilizator: {prompt}
+                    
+                    Răspunde în română, util și concis. Dacă întrebarea e despre transcrieri, folosește contextul.
+                    """
+                    
+                    response = model.generate_content(full_prompt)
+                    response_text = response.text
+                    
+                    st.markdown(response_text)
+                    save_message(st.session_state.session_id, "assistant", response_text)
+                    
+                except Exception as e:
+                    st.error(f"❌ Eroare: {e}")
+
+# ==================== MAIN APP ====================
+
+def main():
+    # Inițializare
+    init_database()
+    init_session()
+    
+    # Sidebar
+    render_sidebar()
     
     # Header
     st.markdown("""
     <div class="main-header">
         <h1>🎬 AI Video Transcriber</h1>
-        <p>Transcrie video-uri folosind Gemini AI</p>
+        <p>Transcrie orice video în orice limbă folosind Google Gemini AI</p>
     </div>
     """, unsafe_allow_html=True)
     
-    # Verificări sistem
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        if GEMINI_AVAILABLE:
-            st.success(f"✅ Gemini API ({GEMINI_VERSION})")
-        else:
-            st.error("❌ Gemini API")
-    
-    with col2:
-        if DOCX_AVAILABLE:
-            st.success("✅ Export Word")
-        else:
-            st.warning("⚠️ Export Word")
-    
-    with col3:
-        if get_active_api_keys():
-            st.success("✅ API Keys")
-        else:
-            st.error("❌ API Keys")
-    
-    st.markdown("---")
-    
     # Tabs
-    tab1, tab2 = st.tabs(["📤 Încarcă Video", "📜 Istoric"])
+    tab1, tab2, tab3 = st.tabs(["📤 Încarcă Video", "📜 Istoric", "💬 Chat AI"])
     
     with tab1:
-        # Upload video
-        uploaded_file = st.file_uploader(
-            "Selectează video",
-            type=['mp4', 'avi', 'mov', 'mkv', 'webm']
-        )
-        
-        if uploaded_file:
-            st.video(uploaded_file)
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                st.info(f"📁 {uploaded_file.name}")
-            with col2:
-                st.info(f"📏 {uploaded_file.size / 1024 / 1024:.2f} MB")
-            
-            if st.button("🚀 Transcrie", type="primary", use_container_width=True):
-                
-                # Verifică API key
-                keys = get_active_api_keys()
-                if not keys:
-                    st.error("❌ Adaugă o cheie API în sidebar!")
-                    return
-                
-                # Progress
-                progress = st.progress(0)
-                status = st.empty()
-                
-                try:
-                    # Salvează video temporar
-                    status.text("📁 Salvare fișier...")
-                    progress.progress(20)
-                    
-                    with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp:
-                        tmp.write(uploaded_file.getbuffer())
-                        tmp_path = tmp.name
-                    
-                    # Transcrie
-                    status.text("🤖 Transcriere cu AI...")
-                    progress.progress(50)
-                    
-                    transcription, error = transcribe_with_gemini(tmp_path, keys[0])
-                    
-                    # Șterge fișierul temporar
-                    os.unlink(tmp_path)
-                    
-                    if error:
-                        st.error(f"❌ Eroare: {error}")
-                        return
-                    
-                    # Salvează în DB
-                    status.text("💾 Salvare...")
-                    progress.progress(90)
-                    
-                    save_transcription(
-                        st.session_state.session_id,
-                        uploaded_file.name,
-                        transcription
-                    )
-                    
-                    # Finalizare
-                    progress.progress(100)
-                    status.text("✅ Completat!")
-                    
-                    st.success("🎉 Transcriere finalizată!")
-                    
-                    # Afișează rezultatul
-                    st.text_area("Transcriere:", transcription, height=300)
-                    
-                    # Descărcare
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        st.download_button(
-                            "📥 Descarcă TXT",
-                            transcription,
-                            f"{uploaded_file.name}.txt",
-                            mime="text/plain"
-                        )
-                    
-                    with col2:
-                        if DOCX_AVAILABLE:
-                            doc = create_word_document(transcription, uploaded_file.name)
-                            if doc:
-                                st.download_button(
-                                    "📥 Descarcă Word",
-                                    doc,
-                                    f"{uploaded_file.name}.docx",
-                                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                                )
-                    
-                except Exception as e:
-                    st.error(f"❌ Eroare: {e}")
+        render_upload_tab()
     
     with tab2:
-        # Istoric
-        st.markdown("### 📜 Istoric Transcrieri")
-        
-        transcriptions = get_transcriptions(st.session_state.session_id)
-        
-        if not transcriptions:
-            st.info("Nu există transcrieri încă.")
-        else:
-            for video_name, text, created_at in transcriptions:
-                with st.expander(f"🎬 {video_name} - {created_at}"):
-                    st.text_area("", text, height=200, key=f"hist_{created_at}")
-                    
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.download_button(
-                            "📥 TXT",
-                            text,
-                            f"{video_name}.txt",
-                            key=f"txt_{created_at}"
-                        )
-                    with col2:
-                        if DOCX_AVAILABLE:
-                            doc = create_word_document(text, video_name)
-                            if doc:
-                                st.download_button(
-                                    "📥 Word",
-                                    doc,
-                                    f"{video_name}.docx",
-                                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                                    key=f"doc_{created_at}"
-                                )
-
-# ==================== MAIN ====================
-
-def main():
-    # Inițializare DB
-    init_database()
+        render_history_tab()
     
-    # Render
-    render_sidebar()
-    render_main()
+    with tab3:
+        render_chat_tab()
 
 if __name__ == "__main__":
     main()
