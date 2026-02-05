@@ -1,5 +1,6 @@
 import streamlit as st
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from typing import Tuple, Optional
 import database as db
 
@@ -21,6 +22,7 @@ class APIKeyManager:
     def __init__(self):
         self.current_key = None
         self.current_key_index = 0
+        self.client = None
         self._load_keys_from_secrets()
     
     def _load_keys_from_secrets(self):
@@ -77,14 +79,17 @@ class APIKeyManager:
         for key in keys:
             try:
                 # Testează cheia
-                genai.configure(api_key=key)
-                model = genai.GenerativeModel('gemini-1.5-flash')
+                client = genai.Client(api_key=key)
                 
                 # Test simplu
-                response = model.generate_content("Test. Răspunde doar cu 'OK'.")
+                response = client.models.generate_content(
+                    model='gemini-2.0-flash-exp',
+                    contents='Test. Răspunde doar cu "OK".'
+                )
                 
                 if response:
                     self.current_key = key
+                    self.client = client
                     db.mark_key_active(key)
                     return key, None
                     
@@ -97,10 +102,11 @@ class APIKeyManager:
                     
         return None, f"❌ Toate cheile au eșuat:\n" + "\n".join(errors)
     
-    def configure_genai(self, api_key: str):
-        """Configurează biblioteca genai cu cheia specificată"""
-        genai.configure(api_key=api_key)
+    def get_client(self, api_key: str):
+        """Returnează un client configurat cu cheia specificată"""
+        self.client = genai.Client(api_key=api_key)
         self.current_key = api_key
+        return self.client
     
     def handle_api_error(self, error: Exception) -> Tuple[bool, str]:
         """
